@@ -61,6 +61,37 @@ jobs:
           flutter pub get
           flutter build macos --release
 
+      - name: Runtime smoke test (launch the built app headlessly)
+        working-directory: client_app/build/macos/Build/Products/Release
+        run: |
+          app_name=$(ls -d *.app | head -n1)
+          binary="$app_name/Contents/MacOS/$(basename "$app_name" .app)"
+          echo "Launching: $binary"
+          "$binary" > smoke_test.log 2>&1 &
+          pid=$!
+          sleep 5
+          if kill -0 $pid 2>/dev/null; then
+            echo "STILL RUNNING after 5s (no immediate crash)"
+            kill $pid
+            echo "smoke_result=pass" >> "$GITHUB_ENV"
+          else
+            echo "PROCESS EXITED EARLY — see smoke_test.log"
+            echo "smoke_result=fail" >> "$GITHUB_ENV"
+          fi
+          cat smoke_test.log || true
+
+      - name: Upload smoke test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-smoke-test-log
+          path: client_app/build/macos/Build/Products/Release/smoke_test.log
+          if-no-files-found: ignore
+
+      - name: Fail job if smoke test failed
+        if: env.smoke_result == 'fail'
+        run: exit 1
+
       - name: Package as a zip
         working-directory: client_app/build/macos/Build/Products/Release
         run: |
@@ -93,7 +124,7 @@ jobs:
       - name: Install Linux desktop build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libgtk-3-dev
+          sudo apt-get install -y ninja-build libgtk-3-dev xvfb
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -115,6 +146,36 @@ jobs:
         run: |
           flutter pub get
           flutter build linux --release
+
+      - name: Runtime smoke test (launch the built app headlessly under Xvfb)
+        working-directory: client_app/build/linux/x64/release/bundle
+        run: |
+          binary=$(ls | grep -v '\.so$' | grep -v '^data$' | grep -v '^lib$' | head -n1)
+          echo "Launching: $binary"
+          xvfb-run -a ./"$binary" > smoke_test.log 2>&1 &
+          pid=$!
+          sleep 5
+          if kill -0 $pid 2>/dev/null; then
+            echo "STILL RUNNING after 5s (no immediate crash)"
+            kill $pid
+            echo "smoke_result=pass" >> "$GITHUB_ENV"
+          else
+            echo "PROCESS EXITED EARLY — see smoke_test.log"
+            echo "smoke_result=fail" >> "$GITHUB_ENV"
+          fi
+          cat smoke_test.log || true
+
+      - name: Upload smoke test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-smoke-test-log
+          path: client_app/build/linux/x64/release/bundle/smoke_test.log
+          if-no-files-found: ignore
+
+      - name: Fail job if smoke test failed
+        if: env.smoke_result == 'fail'
+        run: exit 1
 
       - name: Package as a tarball
         working-directory: client_app/build/linux/x64/release

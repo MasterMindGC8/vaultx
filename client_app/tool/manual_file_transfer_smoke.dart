@@ -6,7 +6,6 @@
 // well over one chunk's worth of bytes) through the real relay + real
 // PQXDH/ratchet session, proving there's no practical size ceiling.
 import 'dart:async';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:client_app/bridge/native_crypto.dart';

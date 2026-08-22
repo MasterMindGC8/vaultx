@@ -1,16 +1,27 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import 'bridge/native_crypto.dart';
 import 'screens/terminal_screen.dart';
+import 'services/app_logger.dart';
 import 'theme/cypher_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AppLogger.ensureInitialized();
+  await AppLogger.info('app starting on ${Platform.operatingSystem}');
   // On macOS/Linux this extracts the bundled native library to a real file
   // on first run (see NativeCrypto.ensureInitialized's doc); on Windows it
   // resolves immediately. Either way, nothing in the app may touch
   // NativeCrypto.instance before this completes.
-  await NativeCrypto.ensureInitialized();
+  try {
+    await NativeCrypto.ensureInitialized();
+    await AppLogger.info('crypto_core native library loaded');
+  } catch (e) {
+    await AppLogger.error('failed to load crypto_core native library', e);
+    rethrow;
+  }
   runApp(const VaultXApp());
 }
 

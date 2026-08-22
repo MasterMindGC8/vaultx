@@ -25,6 +25,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../bridge/native_crypto.dart';
 import '../models/contact.dart';
+import '../services/app_logger.dart';
 import '../services/file_transfer.dart';
 import '../services/relay_client.dart';
 import '../services/update_checker.dart';
@@ -195,6 +196,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       if (!mounted) return;
       setState(() => _connectionStatus = 'ONLINE');
     } catch (e) {
+      await AppLogger.error('relay connection failed ($_relayUrl)', e);
       if (!mounted) return;
       setState(() => _connectionStatus = 'OFFLINE — RELAY UNREACHABLE');
     }
@@ -223,9 +225,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
       }
     } else if (tag == relayTagMessage) {
       final session = _sessions[delivery.sender];
-      if (session == null) return; // no session yet — can't decrypt, drop.
+      if (session == null) {
+        AppLogger.warn('dropped message from ${delivery.sender}: no active session');
+        return;
+      }
       final plaintext = session.decrypt(Uint8List.fromList(body));
-      if (plaintext == null) return;
+      if (plaintext == null) {
+        AppLogger.warn('failed to decrypt message from ${delivery.sender}');
+        return;
+      }
       final contact = _contacts.firstWhere(
         (c) => c.deviceId == delivery.sender,
         orElse: () => Contact(deviceId: delivery.sender, label: delivery.sender),
@@ -402,6 +410,22 @@ class _ConversationScreenState extends State<ConversationScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Device ID copied to clipboard')),
     );
+  }
+
+  /// Reveals the local log file (see services/app_logger.dart) in the
+  /// system file manager, so a user hitting a problem can find and send it
+  /// along for troubleshooting without needing to know where app data
+  /// lives on their platform.
+  Future<void> _openLog() async {
+    final path = AppLogger.path;
+    if (path == null) return;
+    if (Platform.isWindows) {
+      await Process.run('explorer', ['/select,', path]);
+    } else if (Platform.isMacOS) {
+      await Process.run('open', ['-R', path]);
+    } else {
+      await Process.run('xdg-open', [File(path).parent.path]);
+    }
   }
 
   Future<void> _editRelayUrl() async {
@@ -652,6 +676,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
                           AsciiButton(label: 'My ID', onPressed: _copyMyId),
                           const SizedBox(width: 8),
                           AsciiButton(label: 'Updates', onPressed: _checkForUpdates),
+                          const SizedBox(width: 8),
+                          AsciiButton(label: 'View Log', onPressed: _openLog),
                         ],
                       ),
                     ),
