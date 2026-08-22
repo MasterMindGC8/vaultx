@@ -23,3 +23,6 @@
 # Local build output / scratch files, not source
 /VaultX-Windows.zip
 /screenshot.png
+
+# Cross-compiled relay binary, built on demand (not source)
+/transport_relay/relay_linux_amd64
