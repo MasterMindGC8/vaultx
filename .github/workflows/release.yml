@@ -20,6 +20,12 @@ on:
         description: "Existing release tag to attach binaries to (e.g. v1.3.0)"
         required: true
 
+# The default GITHUB_TOKEN is read-only for repository contents unless a
+# workflow explicitly asks for write access — needed here so `gh release
+# upload` can attach build artifacts.
+permissions:
+  contents: write
+
 jobs:
   macos:
     runs-on: macos-14
@@ -58,7 +64,9 @@ jobs:
       - name: Package as a zip
         working-directory: client_app/build/macos/Build/Products/Release
         run: |
-          ditto -c -k --sequesterRsrc --keepParent "Vault X.app" VaultX-macOS.zip
+          app_name=$(ls -d *.app | head -n1)
+          echo "Packaging: $app_name"
+          ditto -c -k --sequesterRsrc --keepParent "$app_name" VaultX-macOS.zip
 
       - name: Determine release tag
         id: tag
