@@ -16,11 +16,16 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
+
 import '../bridge/native_crypto.dart';
 import '../models/contact.dart';
+import '../services/file_transfer.dart';
 import '../services/relay_client.dart';
 import '../services/update_checker.dart';
 import '../theme/cypher_theme.dart';
@@ -43,10 +48,41 @@ const _defaultUpdateManifestUrl =
     'https://raw.githubusercontent.com/MasterMindGC8/vaultx/master/update-manifest.json';
 
 class ChatMessage {
-  const ChatMessage({required this.fromSelf, required this.text, required this.sentAt});
+  const ChatMessage({
+    required this.fromSelf,
+    required this.sentAt,
+    this.text,
+    this.fileName,
+    this.fileSize,
+    this.filePath,
+  });
+
   final bool fromSelf;
-  final String text;
   final DateTime sentAt;
+  final String? text;
+  final String? fileName;
+  final int? fileSize;
+  final String? filePath;
+
+  bool get isFile => fileName != null;
+
+  Map<String, dynamic> toJson() => {
+    'fromSelf': fromSelf,
+    'sentAt': sentAt.toIso8601String(),
+    if (text != null) 'text': text,
+    if (fileName != null) 'fileName': fileName,
+    if (fileSize != null) 'fileSize': fileSize,
+    if (filePath != null) 'filePath': filePath,
+  };
+
+  factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
+    fromSelf: json['fromSelf'] as bool,
+    sentAt: DateTime.parse(json['sentAt'] as String),
+    text: json['text'] as String?,
+    fileName: json['fileName'] as String?,
+    fileSize: json['fileSize'] as int?,
+    filePath: json['filePath'] as String?,
+  );
 }
 
 class ConversationScreen extends StatefulWidget {
@@ -74,6 +110,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
   List<Contact> _contacts = [];
   Contact? _selectedContact;
   final Map<String, NativeSession> _sessions = {};
+  final Map<String, IncomingFileTransfer> _incomingTransfers = {};
+  int _packetSeq = 0;
   final Map<String, List<ChatMessage>> _messagesByContact = {};
   final _composerController = TextEditingController();
   String _connectionStatus = 'CONNECTING...';
@@ -129,25 +167,20 @@ class _ConversationScreenState extends State<ConversationScreen> {
   List<ChatMessage> _loadHistory(Contact contact) {
     final stored = widget.vault.get(utf8.encode('history:${contact.deviceId}'));
     if (stored == null) return [];
-    return utf8
-        .decode(stored)
-        .split('\n')
-        .where((line) => line.isNotEmpty)
-        .map(
-          (line) => ChatMessage(
-            fromSelf: line.startsWith('me: '),
-            text: line.replaceFirst(RegExp(r'^(me|peer): '), ''),
-            sentAt: DateTime.now(),
-          ),
-        )
-        .toList();
+    try {
+      final decoded = jsonDecode(utf8.decode(stored)) as List<dynamic>;
+      return decoded
+          .map((e) => ChatMessage.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return [];
+    }
   }
 
   void _persistHistory(Contact contact) {
-    final lines = (_messagesByContact[contact.deviceId] ?? [])
-        .map((m) => '${m.fromSelf ? 'me' : 'peer'}: ${m.text}')
-        .join('\n');
-    widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode(lines));
+    final messages = _messagesByContact[contact.deviceId] ?? [];
+    final encoded = jsonEncode(messages.map((m) => m.toJson()).toList());
+    widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode(encoded));
   }
 
   Future<void> _connectToRelay() async {
@@ -197,14 +230,58 @@ class _ConversationScreenState extends State<ConversationScreen> {
         (c) => c.deviceId == delivery.sender,
         orElse: () => Contact(deviceId: delivery.sender, label: delivery.sender),
       );
-      setState(() {
-        _messagesByContact
-            .putIfAbsent(contact.deviceId, () => [])
-            .add(ChatMessage(fromSelf: false, text: utf8.decode(plaintext), sentAt: DateTime.now()));
-      });
-      _persistHistory(contact);
+      _handleEnvelope(contact, MessageEnvelope.decode(plaintext));
     }
     _relayStream?.ack(delivery.packetId);
+  }
+
+  void _handleEnvelope(Contact contact, MessageEnvelope envelope) {
+    switch (envelope) {
+      case TextEnvelope(:final body):
+        setState(() {
+          _messagesByContact
+              .putIfAbsent(contact.deviceId, () => [])
+              .add(ChatMessage(fromSelf: false, text: body, sentAt: DateTime.now()));
+        });
+        _persistHistory(contact);
+
+      case FileOfferEnvelope(:final id, :final name, :final size, :final chunkCount):
+        _incomingTransfers[id] = IncomingFileTransfer(
+          name: name,
+          size: size,
+          chunkCount: chunkCount,
+        );
+
+      case FileChunkEnvelope(:final id, :final index, :final data):
+        _incomingTransfers[id]?.addChunk(index, data);
+
+      case FileDoneEnvelope(:final id):
+        _finishIncomingFile(contact, id);
+    }
+  }
+
+  Future<void> _finishIncomingFile(Contact contact, String transferId) async {
+    final transfer = _incomingTransfers.remove(transferId);
+    if (transfer == null || !transfer.isComplete) return;
+    final bytes = transfer.assemble();
+    final downloadsDir = await getApplicationSupportDirectory();
+    final receivedDir = Directory('${downloadsDir.path}/received_files');
+    await receivedDir.create(recursive: true);
+    final savedPath = '${receivedDir.path}/${transfer.name}';
+    await File(savedPath).writeAsBytes(bytes);
+    if (!mounted) return;
+    setState(() {
+      _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
+        ChatMessage(
+          fromSelf: false,
+          sentAt: DateTime.now(),
+          fileName: transfer.name,
+          fileSize: transfer.size,
+          filePath: savedPath,
+        ),
+      );
+    });
+    _persistHistory(contact);
   }
 
   Future<void> _openAddContact() async {
@@ -232,6 +309,17 @@ class _ConversationScreenState extends State<ConversationScreen> {
     );
   }
 
+  void _sendEnvelope(Contact contact, NativeSession session, MessageEnvelope envelope) {
+    final ciphertext = session.encrypt(envelope.encode());
+    final packetId =
+        '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
+    _relayStream?.send(
+      contact.deviceId,
+      packetId,
+      Uint8List.fromList([relayTagMessage, ...ciphertext]),
+    );
+  }
+
   void _sendMessage() {
     final text = _composerController.text.trim();
     final contact = _selectedContact;
@@ -241,18 +329,69 @@ class _ConversationScreenState extends State<ConversationScreen> {
       setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
       return;
     }
-    final ciphertext = session.encrypt(Uint8List.fromList(utf8.encode(text)));
-    final packetId = DateTime.now().microsecondsSinceEpoch.toString();
-    _relayStream?.send(
-      contact.deviceId,
-      packetId,
-      Uint8List.fromList([relayTagMessage, ...ciphertext]),
-    );
+    _sendEnvelope(contact, session, TextEnvelope(text));
     setState(() {
       _messagesByContact
           .putIfAbsent(contact.deviceId, () => [])
           .add(ChatMessage(fromSelf: true, text: text, sentAt: DateTime.now()));
       _composerController.clear();
+    });
+    _persistHistory(contact);
+  }
+
+  /// Sends a file of any size to the selected contact: an offer envelope
+  /// (name/size/chunk count) followed by as many chunk envelopes as needed
+  /// (see file_transfer.dart), each individually ratchet-encrypted and
+  /// relayed as its own packet — there's no per-file size ceiling, only a
+  /// per-chunk one, since the relay never sees more than one chunk at a
+  /// time and never reassembles anything itself.
+  Future<void> _sendFile() async {
+    final contact = _selectedContact;
+    if (contact == null) return;
+    final session = _sessions[contact.deviceId];
+    if (session == null) {
+      setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
+      return;
+    }
+
+    final result = await FilePicker.pickFiles(withData: true);
+    final picked = result?.files.single;
+    if (picked == null || picked.bytes == null) return;
+
+    final bytes = picked.bytes!;
+    final chunks = splitIntoChunks(bytes);
+    final transferId = '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
+
+    setState(() => _connectionStatus = 'SENDING ${picked.name}...');
+    _sendEnvelope(
+      contact,
+      session,
+      FileOfferEnvelope(
+        id: transferId,
+        name: picked.name,
+        size: bytes.length,
+        chunkCount: chunks.length,
+      ),
+    );
+    for (var i = 0; i < chunks.length; i++) {
+      _sendEnvelope(
+        contact,
+        session,
+        FileChunkEnvelope(id: transferId, index: i, data: chunks[i]),
+      );
+    }
+    _sendEnvelope(contact, session, FileDoneEnvelope(transferId));
+    if (!mounted) return;
+    setState(() {
+      _connectionStatus = 'ONLINE';
+      _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
+        ChatMessage(
+          fromSelf: true,
+          sentAt: DateTime.now(),
+          fileName: picked.name,
+          fileSize: bytes.length,
+        ),
+      );
     });
     _persistHistory(contact);
   }
@@ -547,6 +686,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
                           ),
                           const SizedBox(width: 8),
                           AsciiButton(
+                            label: 'Attach',
+                            onPressed: _selectedContact == null ? null : _sendFile,
+                          ),
+                          const SizedBox(width: 8),
+                          AsciiButton(
                             label: 'Send',
                             onPressed: _selectedContact == null ? null : _sendMessage,
                           ),
@@ -634,11 +778,45 @@ class _MessageLine extends StatelessWidget {
 
   final ChatMessage message;
 
+  static String _formatSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  Future<void> _openFile() async {
+    final path = message.filePath;
+    if (path == null) return;
+    if (Platform.isWindows) {
+      await Process.run('explorer', ['/select,', path]);
+    } else if (Platform.isMacOS) {
+      await Process.run('open', ['-R', path]);
+    } else {
+      await Process.run('xdg-open', [File(path).parent.path]);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final prefix = message.fromSelf ? 'you' : 'peer';
     final color = message.fromSelf ? VaultXColors.phosphor : VaultXColors.phosphorDim;
     final time = message.sentAt.toIso8601String().substring(11, 19);
+
+    final bodySpan = message.isFile
+        ? TextSpan(
+            text:
+                '📎 ${message.fileName} (${_formatSize(message.fileSize ?? 0)})'
+                '${message.filePath != null ? ' — click to reveal' : ''}',
+            style: TextStyle(
+              color: VaultXColors.phosphor,
+              decoration: message.filePath != null ? TextDecoration.underline : null,
+            ),
+            recognizer: message.filePath != null
+                ? (TapGestureRecognizer()..onTap = _openFile)
+                : null,
+          )
+        : TextSpan(text: message.text, style: const TextStyle(color: VaultXColors.phosphor));
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: RichText(
@@ -650,7 +828,7 @@ class _MessageLine extends StatelessWidget {
               text: '<$prefix>: ',
               style: TextStyle(color: color, fontWeight: FontWeight.bold),
             ),
-            TextSpan(text: message.text, style: const TextStyle(color: VaultXColors.phosphor)),
+            bodySpan,
           ],
         ),
       ),

@@ -24,8 +24,11 @@ import (
 
 // maxPacketPayloadBytes bounds both prekey bundle uploads and individual
 // relayed packets, so a misbehaving or malicious client can't force
-// unbounded memory growth in the RAM-only queue.
-const maxPacketPayloadBytes = 512 * 1024
+// unbounded memory growth in the RAM-only queue. Large files are sent as
+// many chunks under this cap (see client_app's file-transfer envelope),
+// not as one oversized packet — this limits per-message memory, not total
+// file size.
+const maxPacketPayloadBytes = 2 * 1024 * 1024
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
