@@ -1,0 +1,7 @@
+# Statically link the MSVC C/C++ runtime into crypto_core.dll so it has no
+# external VCRUNTIME140.dll/MSVCP140.dll dependency at all. Flutter's own
+# engine (flutter_windows.dll) still dynamically links the VC++ runtime —
+# see client_app/windows/README-DISTRIBUTION.md for why the Visual C++
+# Redistributable is still bundled with the app despite this.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

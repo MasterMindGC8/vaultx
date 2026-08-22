@@ -1,0 +1,25 @@
+# Rust build artifacts
+/crypto_core/target/
+
+# Go build artifacts
+/transport_relay/relay.exe
+/transport_relay/*.log
+
+# Flutter/Dart build artifacts
+/client_app/build/
+/client_app/.dart_tool/
+/client_app/crypto_core.dll
+
+# Large third-party binaries and generated installer/release output — not
+# source, shouldn't live in git history. See installer/vaultx.iss and
+# dist/README.txt for how these are produced/obtained.
+/installer/vc_redist.x64.exe
+/installer/Output/
+/dist/
+
+*.log
+.vcredist_installed
+
+# Local build output / scratch files, not source
+/VaultX-Windows.zip
+/screenshot.png

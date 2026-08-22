@@ -1,0 +1,40 @@
+name: client_app
+description: "Vault X — zero-knowledge, post-quantum encrypted messenger. Matrix terminal client."
+publish_to: 'none'
+
+version: 1.1.0+2
+
+environment:
+  sdk: ^3.6.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # dart:ffi bindings to crypto_core's cdylib (see lib/bridge/native_crypto.dart).
+  ffi: ^2.1.3
+  flutter_shaders: ^0.1.3
+  http: ^1.6.0
+  web_socket_channel: ^3.0.3
+  package_info_plus: ^9.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+
+  shaders:
+    - assets/shaders/crt.frag
+
+  fonts:
+    - family: Fira Code
+      fonts:
+        - asset: assets/fonts/FiraCode-Regular.ttf
+    - family: VT323
+      fonts:
+        - asset: assets/fonts/VT323-Regular.ttf
