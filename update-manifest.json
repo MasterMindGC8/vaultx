@@ -1,17 +1,17 @@
 {
   "windows": {
-    "version": "1.4.0",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.4.0/VaultXSetup-1.4.0.exe",
-    "notes": "Send files of any size and type — split into individually encrypted chunks, no size ceiling."
+    "version": "1.4.1",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.4.1/VaultXSetup-1.4.1.exe",
+    "notes": "On-disk error logging (View Log button); CI now actually launches the built macOS/Linux apps to verify they run, not just that they compile."
   },
   "macos": {
-    "version": "1.4.0",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.4.0/VaultX-macOS.zip",
+    "version": "1.4.1",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.4.1/VaultX-macOS.zip",
     "notes": "Unsigned build — right-click the app and choose Open the first time to get past Gatekeeper."
   },
   "linux": {
-    "version": "1.4.0",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.4.0/VaultX-linux-x86_64.tar.gz",
+    "version": "1.4.1",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.4.1/VaultX-linux-x86_64.tar.gz",
     "notes": "Extract the tarball and run the client_app executable inside bundle/."
   }
 }
