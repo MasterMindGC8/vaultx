@@ -1,5 +1,17 @@
 {
-  "version": "1.2.0",
-  "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.2.0/VaultXSetup-1.2.0.exe",
-  "notes": "Default relay now points to a real, always-on isolated deployment (OVH VPS) so messaging actually works between two different PCs, not just localhost."
+  "windows": {
+    "version": "1.3.0",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.3.0/VaultXSetup-1.3.0.exe",
+    "notes": "First release with macOS and Linux support (built via GitHub Actions), alongside the existing Windows installer."
+  },
+  "macos": {
+    "version": "1.3.0",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.3.0/VaultX-macOS.zip",
+    "notes": "First macOS build (universal, arm64 + x86_64). Unsigned — see release notes for how to open it past Gatekeeper."
+  },
+  "linux": {
+    "version": "1.3.0",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.3.0/VaultX-linux-x86_64.tar.gz",
+    "notes": "First Linux build (x86_64)."
+  }
 }

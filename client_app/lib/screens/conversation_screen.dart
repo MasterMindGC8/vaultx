@@ -339,6 +339,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       return;
     }
 
+    final canAutoInstall = UpdateChecker.canAutoInstall;
     final shouldUpdate = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -353,11 +354,22 @@ class _ConversationScreenState extends State<ConversationScreen> {
         ),
         actions: [
           AsciiButton(label: 'Later', onPressed: () => Navigator.of(context).pop(false)),
-          AsciiButton(label: 'Update Now', onPressed: () => Navigator.of(context).pop(true)),
+          AsciiButton(
+            label: canAutoInstall ? 'Update Now' : 'Open Download Page',
+            onPressed: () => Navigator.of(context).pop(true),
+          ),
         ],
       ),
     );
     if (shouldUpdate != true) return;
+
+    if (!canAutoInstall) {
+      // macOS/Linux: no safe way to self-replace a running .app bundle or
+      // extracted tarball without a real updater framework — hand the user
+      // the download instead of pretending to install it for them.
+      await UpdateChecker.openInBrowser(update.installerUrl);
+      return;
+    }
 
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
