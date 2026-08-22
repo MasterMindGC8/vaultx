@@ -1,3 +1,4 @@
+// ignore_for_file: avoid_print
 // Manual smoke check for the relay + FFI session wiring, run directly via
 // `dart run tool/manual_relay_smoke.dart` against a locally running
 // transport_relay (see ../transport_relay). Not part of the auto-discovered

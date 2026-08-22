@@ -30,6 +30,8 @@ import 'add_contact_screen.dart';
 const _defaultRelayUrl = 'http://127.0.0.1:8443';
 const _relayUrlVaultKey = 'relay_url_v1';
 const _updateManifestUrlVaultKey = 'update_manifest_url_v1';
+const _defaultUpdateManifestUrl =
+    'https://raw.githubusercontent.com/MasterMindGC8/vaultx/master/update-manifest.json';
 
 class ChatMessage {
   const ChatMessage({required this.fromSelf, required this.text, required this.sentAt});
@@ -85,7 +87,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   String _loadUpdateManifestUrl() {
     final stored = widget.vault.get(utf8.encode(_updateManifestUrlVaultKey));
-    return stored == null ? '' : utf8.decode(stored);
+    return stored == null ? _defaultUpdateManifestUrl : utf8.decode(stored);
   }
 
   void _saveUpdateManifestUrl(String url) {
