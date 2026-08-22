@@ -27,7 +27,16 @@ import '../theme/cypher_theme.dart';
 import '../widgets/terminal_widgets.dart';
 import 'add_contact_screen.dart';
 
-const _defaultRelayUrl = 'http://127.0.0.1:8443';
+// Isolated relay deployment on a dedicated OVH VM (its own systemd unit,
+// its own directory, its own firewall rule — see
+// transport_relay/vaultx-relay.service) — reachable by any device running
+// this app, not just localhost. Transport is currently plain (not
+// TLS-wrapped); message content stays protected regardless since it's
+// end-to-end encrypted before it ever reaches the relay, but that does mean
+// connection metadata (who's connecting, when) isn't hidden from a network
+// observer between a client and this server. See CLAUDE.md for what's and
+// isn't covered at this milestone.
+const _defaultRelayUrl = 'http://51.81.84.85:8443';
 const _relayUrlVaultKey = 'relay_url_v1';
 const _updateManifestUrlVaultKey = 'update_manifest_url_v1';
 const _defaultUpdateManifestUrl =

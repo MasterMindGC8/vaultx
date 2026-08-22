@@ -1,0 +1,22 @@
+[Unit]
+Description=Vault X zero-knowledge relay (isolated — see /home/ubuntu/vaultx-relay)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/vaultx-relay
+ExecStart=/home/ubuntu/vaultx-relay/vaultx-relay
+Environment=VAULTX_RELAY_ADDR=:8443
+Restart=on-failure
+RestartSec=5
+# Isolation: this unit only touches its own working directory and its own
+# listening port. No shared resources (Docker, Caddy, other services) are
+# referenced anywhere in this file.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/vaultx-relay
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,5 @@
 {
-  "version": "1.1.1",
-  "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.1.1/VaultXSetup-1.1.1.exe",
-  "notes": "Update checker now works out of the box (default manifest URL baked in) — no manual configuration needed."
+  "version": "1.2.0",
+  "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.2.0/VaultXSetup-1.2.0.exe",
+  "notes": "Default relay now points to a real, always-on isolated deployment (OVH VPS) so messaging actually works between two different PCs, not just localhost."
 }
