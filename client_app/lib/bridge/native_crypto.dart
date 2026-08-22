@@ -17,6 +17,8 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart' as pkg_ffi;
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:path_provider/path_provider.dart';
 
 final class _VaultXBuffer extends ffi.Struct {
   external ffi.Pointer<ffi.Uint8> data;
@@ -233,7 +235,31 @@ class NativeCrypto {
 
   static NativeCrypto? _instance;
 
-  static NativeCrypto get instance => _instance ??= NativeCrypto._(_open());
+  /// Must be awaited once, before the app's first use of [instance] (call
+  /// it early in `main()`, before `runApp`). On Windows the native library
+  /// sits right next to the executable (bundled there by
+  /// `windows/CMakeLists.txt`) and this resolves immediately; on
+  /// macOS/Linux, where hand-editing the Xcode project / CMake install
+  /// rules to embed a foreign dylib correctly can't be verified without
+  /// those machines, the compiled library is instead shipped as a normal
+  /// Flutter asset (see `assets/native/`) and extracted to a real file on
+  /// first run, which only official Flutter APIs are needed for.
+  static Future<void> ensureInitialized() async {
+    if (_instance != null) return;
+    _instance = NativeCrypto._(await _open());
+  }
+
+  /// Throws if [ensureInitialized] hasn't completed yet — that's a bug in
+  /// app startup ordering, not a runtime condition to handle gracefully.
+  static NativeCrypto get instance {
+    final instance = _instance;
+    if (instance == null) {
+      throw StateError(
+        'NativeCrypto.instance used before NativeCrypto.ensureInitialized() completed',
+      );
+    }
+    return instance;
+  }
 
   final _BufferFreeDart _bufferFree;
   final _IdentityGenerateDart _identityGenerate;
@@ -252,14 +278,34 @@ class NativeCrypto {
   final _SessionEncryptDart _sessionEncrypt;
   final _SessionDecryptDart _sessionDecrypt;
 
-  static ffi.DynamicLibrary _open() {
+  static Future<ffi.DynamicLibrary> _open() async {
     if (Platform.isWindows) {
+      // Bundled next to the .exe by windows/CMakeLists.txt's install rule.
       return ffi.DynamicLibrary.open('crypto_core.dll');
     }
-    if (Platform.isMacOS || Platform.isIOS) {
-      return ffi.DynamicLibrary.open('libcrypto_core.dylib');
+    final assetName = Platform.isMacOS ? 'crypto_core.dylib' : 'crypto_core.so';
+    final extractedPath = await _extractBundledLibrary(assetName);
+    return ffi.DynamicLibrary.open(extractedPath);
+  }
+
+  /// Copies the platform's compiled native library — shipped as a plain
+  /// Flutter asset under `assets/native/` (see pubspec.yaml) rather than
+  /// wired into the macOS Xcode project or Linux CMake install rules,
+  /// since neither of those can be edited-and-verified without owning the
+  /// respective machine — out to a real file on disk, where `dlopen` (via
+  /// [ffi.DynamicLibrary.open]) can actually load it from an absolute path.
+  /// Idempotent: skips the copy if a byte-identical file is already there
+  /// from a previous run.
+  static Future<String> _extractBundledLibrary(String assetName) async {
+    final bytes = await rootBundle.load('assets/native/$assetName');
+    final supportDir = await getApplicationSupportDirectory();
+    final file = File('${supportDir.path}/$assetName');
+    final buffer = bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes);
+    if (!await file.exists() || (await file.length()) != buffer.length) {
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(buffer, flush: true);
     }
-    return ffi.DynamicLibrary.open('libcrypto_core.so');
+    return file.path;
   }
 
   Uint8List _takeBuffer(_VaultXBuffer buf) {

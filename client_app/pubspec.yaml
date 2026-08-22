@@ -2,7 +2,7 @@ name: client_app
 description: "Vault X — zero-knowledge, post-quantum encrypted messenger. Matrix terminal client."
 publish_to: 'none'
 
-version: 1.2.0+4
+version: 1.3.0+5
 
 environment:
   sdk: ^3.6.0
@@ -19,6 +19,7 @@ dependencies:
   http: ^1.6.0
   web_socket_channel: ^3.0.3
   package_info_plus: ^9.0.1
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
@@ -30,6 +31,16 @@ flutter:
 
   shaders:
     - assets/shaders/crt.frag
+
+  # Platform-specific compiled crypto_core library, extracted to a real
+  # file at startup on macOS/Linux (see bridge/native_crypto.dart) rather
+  # than wired into the Xcode project / CMake install rules, which can't be
+  # edited-and-verified without owning those machines. CI replaces these
+  # placeholders with the real build output for each platform before
+  # running `flutter build` — see .github/workflows/release.yml.
+  assets:
+    - assets/native/crypto_core.dylib
+    - assets/native/crypto_core.so
 
   fonts:
     - family: Fira Code

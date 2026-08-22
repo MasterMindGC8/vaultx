@@ -1,0 +1,130 @@
+name: Build and attach release binaries
+
+# Builds macOS and Linux binaries on GitHub's own runners — Windows is
+# still built and released manually (see dist/README.txt), since Inno
+# Setup + the local dev flow already covers it well. This exists because
+# neither macOS nor Linux can be honestly cross-compiled/verified from a
+# Windows machine (no Xcode, no real Linux GTK toolchain).
+#
+# Triggered by pushing a tag (vX.Y.Z) that already has a matching GitHub
+# Release (create it first, e.g. `gh release create vX.Y.Z ...`) — each
+# job uploads its artifact to that same release. Can also be triggered
+# manually for a given tag via workflow_dispatch.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach binaries to (e.g. v1.3.0)"
+        required: true
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build crypto_core for both Apple architectures
+        working-directory: crypto_core
+        run: |
+          cargo build --release --lib --target aarch64-apple-darwin
+          cargo build --release --lib --target x86_64-apple-darwin
+
+      - name: Combine into a universal dylib
+        run: |
+          mkdir -p client_app/assets/native
+          lipo -create \
+            crypto_core/target/aarch64-apple-darwin/release/libcrypto_core.dylib \
+            crypto_core/target/x86_64-apple-darwin/release/libcrypto_core.dylib \
+            -output client_app/assets/native/crypto_core.dylib
+          lipo -info client_app/assets/native/crypto_core.dylib
+
+      - name: Build Flutter macOS app
+        working-directory: client_app
+        run: |
+          flutter pub get
+          flutter build macos --release
+
+      - name: Package as a zip
+        working-directory: client_app/build/macos/Build/Products/Release
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "Vault X.app" VaultX-macOS.zip
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "client_app/build/macos/Build/Products/Release/VaultX-macOS.zip" \
+            --clobber --repo "${{ github.repository }}"
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build crypto_core
+        working-directory: crypto_core
+        run: cargo build --release --lib
+
+      - name: Copy native library into assets
+        run: |
+          mkdir -p client_app/assets/native
+          cp crypto_core/target/release/libcrypto_core.so client_app/assets/native/crypto_core.so
+
+      - name: Build Flutter Linux app
+        working-directory: client_app
+        run: |
+          flutter pub get
+          flutter build linux --release
+
+      - name: Package as a tarball
+        working-directory: client_app/build/linux/x64/release
+        run: tar -czf VaultX-linux-x86_64.tar.gz bundle
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "client_app/build/linux/x64/release/VaultX-linux-x86_64.tar.gz" \
+            --clobber --repo "${{ github.repository }}"
