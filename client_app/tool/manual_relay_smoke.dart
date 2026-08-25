@@ -7,13 +7,13 @@
 // conversation_screen.dart uses, without touching the GUI at all.
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:client_app/bridge/native_crypto.dart';
 import 'package:client_app/services/relay_client.dart';
 
 Future<void> main() async {
+  await NativeCrypto.ensureInitialized();
   const relayUrl = 'http://127.0.0.1:8443';
   var failures = 0;
 
@@ -100,5 +100,7 @@ Future<void> main() async {
   bob.dispose();
 
   print(failures == 0 ? '\nALL CHECKS PASSED' : '\n$failures CHECK(S) FAILED');
-  exit(failures == 0 ? 0 : 1);
+  if (failures > 0) {
+    throw StateError('$failures relay smoke check(s) failed');
+  }
 }

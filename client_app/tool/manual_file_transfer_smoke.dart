@@ -13,7 +13,7 @@ import 'package:client_app/services/file_transfer.dart';
 import 'package:client_app/services/relay_client.dart';
 
 Future<void> main() async {
-  const relayUrl = 'http://51.81.84.85:8443';
+  const relayUrl = 'http://127.0.0.1:8443';
   var failures = 0;
   void check(String label, bool condition) {
     print(condition ? '[OK] $label' : '[FAIL] $label');
@@ -68,6 +68,7 @@ Future<void> main() async {
           if (!done.isCompleted) done.complete();
         }
       case TextEnvelope():
+      case WipeEnvelope():
         break;
     }
     bobStream.ack(delivery.packetId);
