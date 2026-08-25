@@ -1,17 +1,17 @@
 {
   "windows": {
-    "version": "1.6.0",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.0/VaultXSetup-1.6.0.exe",
-    "notes": "Fixed: chats breaking when both sides add each other at the same time. Added remove-contact, reveal-on-tap messages (shown as ciphertext by default), and burn-on-close chat history."
+    "version": "1.6.1",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.1/VaultXSetup-1.6.1.exe",
+    "notes": "Fixed: the decoy/duress PIN failing with ACCESS DENIED the first time you tried it right after setup (needed a restart before). Fixed a debug-mode chat screen crash and a toolbar that could overflow on a narrow window."
   },
   "macos": {
-    "version": "1.6.0",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.0/VaultX-macOS.zip",
-    "notes": "Fixed: chats breaking when both sides add each other at the same time. Added remove-contact, reveal-on-tap messages (shown as ciphertext by default), and burn-on-close chat history. Unsigned build — right-click the app and choose Open the first time to get past Gatekeeper."
+    "version": "1.6.1",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.1/VaultX-macOS.zip",
+    "notes": "Fixed: the decoy/duress PIN failing with ACCESS DENIED the first time you tried it right after setup (needed a restart before). Fixed a debug-mode chat screen crash and a toolbar that could overflow on a narrow window. Unsigned build — right-click the app and choose Open the first time to get past Gatekeeper."
   },
   "linux": {
-    "version": "1.6.0",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.0/VaultX-linux-x86_64.tar.gz",
-    "notes": "Fixed: chats breaking when both sides add each other at the same time. Added remove-contact, reveal-on-tap messages (shown as ciphertext by default), and burn-on-close chat history. Extract the tarball and run the client_app executable inside bundle/."
+    "version": "1.6.1",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.1/VaultX-linux-x86_64.tar.gz",
+    "notes": "Fixed: the decoy/duress PIN failing with ACCESS DENIED the first time you tried it right after setup (needed a restart before). Fixed a debug-mode chat screen crash and a toolbar that could overflow on a narrow window. Extract the tarball and run the client_app executable inside bundle/."
   }
 }
