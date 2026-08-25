@@ -90,7 +90,8 @@ class _AddContactScreenState extends State<AddContactScreen> {
         );
         return;
       }
-      final outcome = NativeCrypto.instance.initiateSession(widget.identity, bundle);
+      final outcome =
+          NativeCrypto.instance.initiateSession(widget.identity, bundle);
       if (outcome == null) {
         setState(() => _statusMessage = 'HANDSHAKE FAILED — MALFORMED BUNDLE');
         return;
@@ -100,7 +101,9 @@ class _AddContactScreenState extends State<AddContactScreen> {
         AddContactResult(
           contact: Contact(
             deviceId: friendId,
-            label: label.isEmpty ? '0x${friendId.substring(0, 8).toUpperCase()}' : label,
+            label: label.isEmpty
+                ? '0x${friendId.substring(0, 8).toUpperCase()}'
+                : label,
           ),
           session: outcome.session,
           handshakePacketId: DateTime.now().microsecondsSinceEpoch.toString(),
@@ -116,105 +119,117 @@ class _AddContactScreenState extends State<AddContactScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: VaultXColors.background,
+      // Scrollable rather than a bare Center: on a short window the two
+      // stacked panels (device id + add-contact form) can be taller than
+      // the available height (only visible in debug mode / a resized
+      // window as an overflow warning stripe, since release builds strip
+      // this specific layout assertion rather than actually avoiding it).
       body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 560),
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                TerminalPanel(
-                  title: 'your device id — share this with a friend',
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      SelectableText(
-                        widget.myDeviceId,
-                        style: const TextStyle(
-                          color: VaultXColors.phosphor,
-                          fontFamily: VaultXFonts.mono,
-                          fontSize: 13,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: AsciiButton(label: 'Copy', onPressed: _copyMyId),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                TerminalPanel(
-                  title: 'add a contact',
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text(
-                        "ASK YOUR FRIEND FOR THEIR DEVICE ID (SHOWN ON THIS SAME\n"
-                        "SCREEN ON THEIR END) AND PASTE IT BELOW. THEY MUST HAVE\n"
-                        "OPENED THE APP AT LEAST ONCE SO THEIR DEVICE HAS\n"
-                        "PUBLISHED ITSELF TO THE RELAY.",
-                        style: TextStyle(
-                          color: VaultXColors.phosphorDim,
-                          fontFamily: VaultXFonts.mono,
-                          fontSize: 12,
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      const Text(
-                        'LABEL (OPTIONAL)',
-                        style: TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
-                      ),
-                      const SizedBox(height: 4),
-                      TerminalTextField(
-                        controller: _labelController,
-                        hintText: 'e.g. Alex',
-                      ),
-                      const SizedBox(height: 16),
-                      const Text(
-                        "FRIEND'S DEVICE ID",
-                        style: TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
-                      ),
-                      const SizedBox(height: 4),
-                      TerminalTextField(
-                        controller: _deviceIdController,
-                        hintText: '64 hex characters',
-                        onSubmitted: (_) => _addContact(),
-                      ),
-                      if (_statusMessage != null) ...[
-                        const SizedBox(height: 12),
-                        Text(
-                          _statusMessage!,
+        child: SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TerminalPanel(
+                    title: 'your device id — share this with a friend',
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SelectableText(
+                          widget.myDeviceId,
                           style: const TextStyle(
                             color: VaultXColors.phosphor,
+                            fontFamily: VaultXFonts.mono,
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child:
+                              AsciiButton(label: 'Copy', onPressed: _copyMyId),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TerminalPanel(
+                    title: 'add a contact',
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          "ASK YOUR FRIEND FOR THEIR DEVICE ID (SHOWN ON THIS SAME\n"
+                          "SCREEN ON THEIR END) AND PASTE IT BELOW. THEY MUST HAVE\n"
+                          "OPENED THE APP AT LEAST ONCE SO THEIR DEVICE HAS\n"
+                          "PUBLISHED ITSELF TO THE RELAY.",
+                          style: TextStyle(
+                            color: VaultXColors.phosphorDim,
                             fontFamily: VaultXFonts.mono,
                             fontSize: 12,
                           ),
                         ),
-                      ],
-                      const SizedBox(height: 20),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.end,
-                        children: [
-                          AsciiButton(
-                            label: 'Cancel',
-                            onPressed: () => Navigator.of(context).pop(),
-                          ),
-                          const SizedBox(width: 8),
-                          AsciiButton(
-                            label: _busy ? 'Working...' : 'Add',
-                            onPressed: _busy ? null : _addContact,
+                        const SizedBox(height: 16),
+                        const Text(
+                          'LABEL (OPTIONAL)',
+                          style: TextStyle(
+                              color: VaultXColors.phosphor,
+                              fontFamily: VaultXFonts.mono),
+                        ),
+                        const SizedBox(height: 4),
+                        TerminalTextField(
+                          controller: _labelController,
+                          hintText: 'e.g. Alex',
+                        ),
+                        const SizedBox(height: 16),
+                        const Text(
+                          "FRIEND'S DEVICE ID",
+                          style: TextStyle(
+                              color: VaultXColors.phosphor,
+                              fontFamily: VaultXFonts.mono),
+                        ),
+                        const SizedBox(height: 4),
+                        TerminalTextField(
+                          controller: _deviceIdController,
+                          hintText: '64 hex characters',
+                          onSubmitted: (_) => _addContact(),
+                        ),
+                        if (_statusMessage != null) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            _statusMessage!,
+                            style: const TextStyle(
+                              color: VaultXColors.phosphor,
+                              fontFamily: VaultXFonts.mono,
+                              fontSize: 12,
+                            ),
                           ),
                         ],
-                      ),
-                    ],
+                        const SizedBox(height: 20),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            AsciiButton(
+                              label: 'Cancel',
+                              onPressed: () => Navigator.of(context).pop(),
+                            ),
+                            const SizedBox(width: 8),
+                            AsciiButton(
+                              label: _busy ? 'Working...' : 'Add',
+                              onPressed: _busy ? null : _addContact,
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
