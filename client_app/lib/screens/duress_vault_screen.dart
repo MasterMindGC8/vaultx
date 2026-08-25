@@ -112,6 +112,14 @@ class _DuressVaultScreenState extends State<DuressVaultScreen> {
         setState(() => _statusMessage = 'VAULT PROVISIONING FAILED');
         return;
       }
+      // Provisioning only needs to confirm the decoy vault was created
+      // successfully — it isn't entered now, so its handle must be freed
+      // here. Leaving it open (as this used to) holds the decoy vault
+      // file locked for the rest of the process, causing any decoy PIN
+      // unlock attempt later in the same session to fail with "ACCESS
+      // DENIED" until the app actually restarts and the OS reclaims the
+      // handle.
+      decoyVault.dispose();
       if (!mounted) return;
       _enterConsole(realVault, isDecoy: false);
     } finally {

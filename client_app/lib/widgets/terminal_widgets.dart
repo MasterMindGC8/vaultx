@@ -15,12 +15,24 @@ class TerminalPanel extends StatelessWidget {
     this.title,
     this.borderColor = VaultXColors.border,
     this.padding = const EdgeInsets.all(16),
+    this.expandContent = false,
   });
 
   final Widget child;
   final String? title;
   final Color borderColor;
   final EdgeInsets padding;
+
+  /// When true, [child] is wrapped in [Expanded] instead of sized to its
+  /// own content. Needed whenever [child] itself relies on being given a
+  /// bounded height — e.g. a `Column` containing an `Expanded`/flexible
+  /// list — since this panel's own internal `Column` otherwise hands
+  /// non-flex children (the title bar, then `child`) unbounded height by
+  /// default (standard `Column` behavior for non-flex slots), which crashes
+  /// under debug-mode layout assertions the moment `child` tries to use
+  /// `Expanded` itself. Default false so panels sized to their natural
+  /// content (PIN forms, etc.) are unaffected.
+  final bool expandContent;
 
   @override
   Widget build(BuildContext context) {
@@ -59,7 +71,9 @@ class TerminalPanel extends StatelessWidget {
                 ),
               ),
             ),
-          Padding(padding: padding, child: child),
+          expandContent
+              ? Expanded(child: Padding(padding: padding, child: child))
+              : Padding(padding: padding, child: child),
         ],
       ),
     );

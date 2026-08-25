@@ -777,6 +777,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
               child: TerminalPanel(
                 title: 'contacts',
                 padding: EdgeInsets.zero,
+                expandContent: true,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -862,20 +863,27 @@ class _ConversationScreenState extends State<ConversationScreen> {
                     ? 'terminal // no contact selected'
                     : 'terminal // ${_selectedContact!.label}',
                 padding: EdgeInsets.zero,
+                expandContent: true,
                 child: Column(
                   children: [
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                      child: Row(
+                      // Wrap rather than Row: two badges plus three buttons
+                      // need ~1150px to fit on one line, wider than this
+                      // panel gets once the window is resized down or the
+                      // sidebar is open — Row would silently overflow off
+                      // the right edge (only visible as a debug-mode
+                      // warning stripe, never a crash, so easy to miss).
+                      // Wrap instead lets buttons flow onto a second line.
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
                           const CipherBadge(label: 'ENC: CHACHA20-POLY1305'),
-                          const SizedBox(width: 8),
                           const CipherBadge(label: 'POST-QUANTUM: ENABLED'),
-                          const Spacer(),
                           AsciiButton(label: 'My ID', onPressed: _copyMyId),
-                          const SizedBox(width: 8),
                           AsciiButton(label: 'Updates', onPressed: _checkForUpdates),
-                          const SizedBox(width: 8),
                           AsciiButton(label: 'View Log', onPressed: _openLog),
                         ],
                       ),
@@ -944,8 +952,13 @@ class _NoContactSelectedHint extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Scrollable rather than a bare Center: on a short window this
+    // multi-line hint plus the button can be taller than the available
+    // space (only visible in debug mode as an overflow warning stripe,
+    // since Flutter strips this specific layout assertion from release
+    // builds — silently invisible there rather than actually fixed).
     return Center(
-      child: Padding(
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
