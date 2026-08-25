@@ -41,6 +41,8 @@ sealed class MessageEnvelope {
         );
       case 'file_done':
         return FileDoneEnvelope(json['id'] as String);
+      case 'wipe':
+        return WipeEnvelope();
       default:
         throw FormatException('unknown envelope type: ${json['t']}');
     }
@@ -100,6 +102,17 @@ class FileDoneEnvelope extends MessageEnvelope {
 
   @override
   Map<String, dynamic> toJson() => {'t': 'file_done', 'id': id};
+}
+
+/// Sent through the encrypted session when a device explicitly closes the
+/// app, telling the peer "I'm burning our chat history on my end — burn
+/// yours too." Authenticated implicitly by arriving over the already
+/// established ratchet session (the relay itself never sees this, or
+/// anything else, in plaintext), so it can't be spoofed by anyone who
+/// doesn't already hold that session's keys.
+class WipeEnvelope extends MessageEnvelope {
+  @override
+  Map<String, dynamic> toJson() => {'t': 'wipe'};
 }
 
 /// Splits [bytes] into [fileChunkSize]-sized pieces (the last one may be

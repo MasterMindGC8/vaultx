@@ -13,6 +13,7 @@
 // `isDecoy`. A decoy vault has its own independent identity and contact
 // list, stored the same way; it just starts out empty like any fresh
 // install would.
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -50,17 +51,26 @@ const _defaultUpdateManifestUrl =
 
 class ChatMessage {
   const ChatMessage({
+    required this.id,
     required this.fromSelf,
     required this.sentAt,
     this.text,
+    this.cipherHex,
     this.fileName,
     this.fileSize,
     this.filePath,
   });
 
+  final String id;
   final bool fromSelf;
   final DateTime sentAt;
   final String? text;
+
+  /// Hex of the actual Double Ratchet ciphertext this text message was
+  /// carried as — shown by default instead of [text] (see
+  /// `_MessageLine`'s reveal-on-tap behavior). Only set for text messages;
+  /// files already require an explicit tap-to-open.
+  final String? cipherHex;
   final String? fileName;
   final int? fileSize;
   final String? filePath;
@@ -68,22 +78,34 @@ class ChatMessage {
   bool get isFile => fileName != null;
 
   Map<String, dynamic> toJson() => {
+    'id': id,
     'fromSelf': fromSelf,
     'sentAt': sentAt.toIso8601String(),
     if (text != null) 'text': text,
+    if (cipherHex != null) 'cipherHex': cipherHex,
     if (fileName != null) 'fileName': fileName,
     if (fileSize != null) 'fileSize': fileSize,
     if (filePath != null) 'filePath': filePath,
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
+    id: json['id'] as String? ?? '${json['sentAt']}-${json['fromSelf']}',
     fromSelf: json['fromSelf'] as bool,
     sentAt: DateTime.parse(json['sentAt'] as String),
     text: json['text'] as String?,
+    cipherHex: json['cipherHex'] as String?,
     fileName: json['fileName'] as String?,
     fileSize: json['fileSize'] as int?,
     filePath: json['filePath'] as String?,
   );
+}
+
+String _bytesToHex(Uint8List bytes) {
+  final buffer = StringBuffer();
+  for (final b in bytes) {
+    buffer.write(b.toRadixString(16).padLeft(2, '0'));
+  }
+  return buffer.toString();
 }
 
 class ConversationScreen extends StatefulWidget {
@@ -111,12 +133,33 @@ class _ConversationScreenState extends State<ConversationScreen> {
   List<Contact> _contacts = [];
   Contact? _selectedContact;
   final Map<String, NativeSession> _sessions = {};
+
+  // Device IDs we sent our own handshake to via "Add Contact". Needed to
+  // resolve "glare": if both sides click Add Contact for each other around
+  // the same time, each independently starts its own PQXDH handshake, and
+  // without this, each side's incoming handshake would silently overwrite
+  // its own outgoing one — leaving both sides with different, unrelated
+  // session keys that can never decrypt each other's messages. Both clients
+  // apply the same deterministic tie-break (lower device ID's handshake
+  // always wins) so they converge on exactly one shared session either way.
+  final Set<String> _selfInitiated = {};
+
   final Map<String, IncomingFileTransfer> _incomingTransfers = {};
   int _packetSeq = 0;
   final Map<String, List<ChatMessage>> _messagesByContact = {};
   final _composerController = TextEditingController();
   String _connectionStatus = 'CONNECTING...';
   late String _updateManifestUrl;
+
+  // Which message ids are currently shown decrypted (see _MessageLine):
+  // every text message renders as its raw ciphertext hex by default, and
+  // tapping it reveals the plaintext for 60 seconds before auto-hiding
+  // again. Either side can re-reveal as many times as they want — this is
+  // a local display gate, not an extra layer of encryption.
+  final Set<String> _revealedMessageIds = {};
+  final Map<String, Timer> _revealTimers = {};
+
+  String _newMessageId() => '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
 
   @override
   void initState() {
@@ -208,8 +251,23 @@ class _ConversationScreenState extends State<ConversationScreen> {
     final body = delivery.payload.sublist(1);
 
     if (tag == relayTagHandshake) {
+      final peer = delivery.sender;
+      // Glare resolution: if we already sent our own handshake to this
+      // peer AND our device ID sorts lower (we're the canonical
+      // initiator), keep our own session and ignore their incoming
+      // handshake — they will independently reach the same conclusion in
+      // reverse (their ID sorts higher, so they defer to ours) and
+      // overwrite their side to match. If we didn't self-initiate, or our
+      // ID sorts higher, always accept the incoming handshake as normal.
+      final weSelfInitiated = _selfInitiated.contains(peer);
+      final weAreCanonicalInitiator = _myDeviceId.compareTo(peer) < 0;
+      if (weSelfInitiated && weAreCanonicalInitiator) {
+        _relayStream?.ack(delivery.packetId);
+        return;
+      }
       final session = NativeCrypto.instance.respondSession(widget.identity, body);
       if (session == null) return;
+      _selfInitiated.remove(peer);
       _sessions[delivery.sender] = session;
       if (!_contacts.any((c) => c.deviceId == delivery.sender)) {
         final newContact = Contact(
@@ -238,18 +296,26 @@ class _ConversationScreenState extends State<ConversationScreen> {
         (c) => c.deviceId == delivery.sender,
         orElse: () => Contact(deviceId: delivery.sender, label: delivery.sender),
       );
-      _handleEnvelope(contact, MessageEnvelope.decode(plaintext));
+      _handleEnvelope(contact, MessageEnvelope.decode(plaintext), Uint8List.fromList(body));
     }
     _relayStream?.ack(delivery.packetId);
   }
 
-  void _handleEnvelope(Contact contact, MessageEnvelope envelope) {
+  void _handleEnvelope(Contact contact, MessageEnvelope envelope, Uint8List ciphertext) {
     switch (envelope) {
       case TextEnvelope(:final body):
         setState(() {
           _messagesByContact
               .putIfAbsent(contact.deviceId, () => [])
-              .add(ChatMessage(fromSelf: false, text: body, sentAt: DateTime.now()));
+              .add(
+                ChatMessage(
+                  id: _newMessageId(),
+                  fromSelf: false,
+                  text: body,
+                  cipherHex: _bytesToHex(ciphertext),
+                  sentAt: DateTime.now(),
+                ),
+              );
         });
         _persistHistory(contact);
 
@@ -265,7 +331,32 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
       case FileDoneEnvelope(:final id):
         _finishIncomingFile(contact, id);
+
+      case WipeEnvelope():
+        _wipeContactHistory(contact, notifyPeer: false);
     }
+  }
+
+  /// Permanently clears local message history with [contact]. If
+  /// [notifyPeer] is true and a session is active, also tells the peer to
+  /// burn their copy (see `WipeEnvelope`) — used when this device is the
+  /// one explicitly closing (see `dispose`). Contacts and sessions
+  /// themselves are left intact; only the message log is destroyed.
+  void _wipeContactHistory(Contact contact, {required bool notifyPeer}) {
+    final session = _sessions[contact.deviceId];
+    if (notifyPeer && session != null) {
+      _sendEnvelope(contact, session, WipeEnvelope());
+    }
+    for (final message in _messagesByContact[contact.deviceId] ?? const <ChatMessage>[]) {
+      _revealTimers.remove(message.id)?.cancel();
+      _revealedMessageIds.remove(message.id);
+    }
+    if (mounted) {
+      setState(() => _messagesByContact[contact.deviceId] = []);
+    } else {
+      _messagesByContact[contact.deviceId] = [];
+    }
+    widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode('[]'));
   }
 
   Future<void> _finishIncomingFile(Contact contact, String transferId) async {
@@ -281,6 +372,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
     setState(() {
       _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
         ChatMessage(
+          id: _newMessageId(),
           fromSelf: false,
           sentAt: DateTime.now(),
           fileName: transfer.name,
@@ -304,6 +396,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
     );
     if (result == null) return;
     _sessions[result.contact.deviceId] = result.session;
+    _selfInitiated.add(result.contact.deviceId);
     setState(() {
       _contacts = [..._contacts, result.contact];
       _messagesByContact[result.contact.deviceId] = [];
@@ -317,15 +410,57 @@ class _ConversationScreenState extends State<ConversationScreen> {
     );
   }
 
-  void _sendEnvelope(Contact contact, NativeSession session, MessageEnvelope envelope) {
+  /// Wipes a contact's session, history, and glare-tracking state and
+  /// removes them from the list. Use this to recover from a stuck/broken
+  /// session (e.g. both sides clicked "Add Contact" on an older build
+  /// before glare resolution existed) — after removing, either side can
+  /// hit "+ Add Contact" again to redo the handshake cleanly.
+  Future<void> _removeContact(Contact contact) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: VaultXColors.backgroundPanel,
+        title: const Text(
+          'REMOVE CONTACT?',
+          style: TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
+        ),
+        content: Text(
+          'This deletes your local session and message history with '
+          '"${contact.label}". They will need to be re-added to chat again.',
+          style: const TextStyle(color: VaultXColors.phosphorDim, fontFamily: VaultXFonts.mono),
+        ),
+        actions: [
+          AsciiButton(label: 'Cancel', onPressed: () => Navigator.of(context).pop(false)),
+          AsciiButton(label: 'Remove', onPressed: () => Navigator.of(context).pop(true)),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    _sessions.remove(contact.deviceId)?.dispose();
+    _selfInitiated.remove(contact.deviceId);
+    // No delete op is exposed over the FFI bridge (put/get only) — an
+    // empty history blob reads back the same as "no history" via
+    // _loadHistory's empty-list decode.
+    widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode('[]'));
+    setState(() {
+      _contacts = _contacts.where((c) => c.deviceId != contact.deviceId).toList();
+      _messagesByContact.remove(contact.deviceId);
+      if (_selectedContact?.deviceId == contact.deviceId) {
+        _selectedContact = _contacts.isNotEmpty ? _contacts.first : null;
+      }
+    });
+    _saveContacts();
+  }
+
+  Uint8List _sendEnvelope(Contact contact, NativeSession session, MessageEnvelope envelope) {
     final ciphertext = session.encrypt(envelope.encode());
-    final packetId =
-        '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
+    final packetId = _newMessageId();
     _relayStream?.send(
       contact.deviceId,
       packetId,
       Uint8List.fromList([relayTagMessage, ...ciphertext]),
     );
+    return ciphertext;
   }
 
   void _sendMessage() {
@@ -337,11 +472,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
       setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
       return;
     }
-    _sendEnvelope(contact, session, TextEnvelope(text));
+    final ciphertext = _sendEnvelope(contact, session, TextEnvelope(text));
     setState(() {
       _messagesByContact
           .putIfAbsent(contact.deviceId, () => [])
-          .add(ChatMessage(fromSelf: true, text: text, sentAt: DateTime.now()));
+          .add(
+            ChatMessage(
+              id: _newMessageId(),
+              fromSelf: true,
+              text: text,
+              cipherHex: _bytesToHex(ciphertext),
+              sentAt: DateTime.now(),
+            ),
+          );
       _composerController.clear();
     });
     _persistHistory(contact);
@@ -394,6 +537,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       _connectionStatus = 'ONLINE';
       _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
         ChatMessage(
+          id: _newMessageId(),
           fromSelf: true,
           sentAt: DateTime.now(),
           fileName: picked.name,
@@ -402,6 +546,23 @@ class _ConversationScreenState extends State<ConversationScreen> {
       );
     });
     _persistHistory(contact);
+  }
+
+  /// Toggles a message between its default ciphertext-hex view and
+  /// plaintext. A reveal auto-expires after 60 seconds back to ciphertext;
+  /// either side can re-reveal as many times as they like — see the
+  /// `_revealedMessageIds` field doc for what this is (and isn't).
+  void _toggleReveal(String messageId) {
+    _revealTimers.remove(messageId)?.cancel();
+    if (_revealedMessageIds.contains(messageId)) {
+      setState(() => _revealedMessageIds.remove(messageId));
+      return;
+    }
+    setState(() => _revealedMessageIds.add(messageId));
+    _revealTimers[messageId] = Timer(const Duration(seconds: 60), () {
+      _revealTimers.remove(messageId);
+      if (mounted) setState(() => _revealedMessageIds.remove(messageId));
+    });
   }
 
   Future<void> _copyMyId() async {
@@ -493,14 +654,34 @@ class _ConversationScreenState extends State<ConversationScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Checking for updates...')),
     );
-    final update = await UpdateChecker.checkForUpdate(manifestUrl);
-    if (!mounted) return;
+    await AppLogger.info('update check started ($manifestUrl)');
+    UpdateInfo? update;
+    try {
+      // UpdateChecker.checkForUpdate already times out its own HTTP fetch
+      // and swallows network/parse errors, but the PackageInfo lookup after
+      // it isn't covered by that inner timeout — this outer one is a hard
+      // backstop so the "Checking for updates..." snackbar can never hang
+      // indefinitely no matter what fails underneath.
+      update = await UpdateChecker.checkForUpdate(manifestUrl).timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      await AppLogger.warn('update check timed out ($manifestUrl)');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Update check timed out — try again later.')),
+      );
+      return;
+    }
     if (update == null) {
+      await AppLogger.info('update check: already on the latest version');
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("You're on the latest version.")),
       );
       return;
     }
+    final resolvedUpdate = update;
+    await AppLogger.info('update check: v${resolvedUpdate.version} available');
+    if (!mounted) return;
 
     final canAutoInstall = UpdateChecker.canAutoInstall;
     final shouldUpdate = await showDialog<bool>(
@@ -508,11 +689,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
       builder: (context) => AlertDialog(
         backgroundColor: VaultXColors.backgroundPanel,
         title: Text(
-          'UPDATE AVAILABLE: v${update.version}',
+          'UPDATE AVAILABLE: v${resolvedUpdate.version}',
           style: const TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
         ),
         content: Text(
-          update.notes ?? 'A newer version of Vault X is available.',
+          resolvedUpdate.notes ?? 'A newer version of Vault X is available.',
           style: const TextStyle(color: VaultXColors.phosphorDim, fontFamily: VaultXFonts.mono),
         ),
         actions: [
@@ -530,7 +711,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       // macOS/Linux: no safe way to self-replace a running .app bundle or
       // extracted tarball without a real updater framework — hand the user
       // the download instead of pretending to install it for them.
-      await UpdateChecker.openInBrowser(update.installerUrl);
+      await UpdateChecker.openInBrowser(resolvedUpdate.installerUrl);
       return;
     }
 
@@ -539,7 +720,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       const SnackBar(content: Text('Downloading update...')),
     );
     try {
-      await UpdateChecker.downloadAndLaunchInstaller(update.installerUrl);
+      await UpdateChecker.downloadAndLaunchInstaller(resolvedUpdate.installerUrl);
       // The installer needs this process's files unlocked to overwrite
       // them; closing now (rather than leaving the user to close it
       // manually) is what makes this a true one-click update.
@@ -555,6 +736,23 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   @override
   void dispose() {
+    // Explicit app close: burn this device's chat history with every
+    // contact we still hold an active session with, and tell each peer
+    // (over their own already-established encrypted session) to burn
+    // their copy too. Best effort only — sent fire-and-forget over an
+    // already-open socket right before it closes, so it covers a normal
+    // window close but not a forced kill (task manager, power loss),
+    // which never runs this at all.
+    for (final contact in _contacts) {
+      final session = _sessions[contact.deviceId];
+      if (session != null) {
+        _sendEnvelope(contact, session, WipeEnvelope());
+      }
+      widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode('[]'));
+    }
+    for (final timer in _revealTimers.values) {
+      timer.cancel();
+    }
     _relayStream?.close();
     for (final session in _sessions.values) {
       session.dispose();
@@ -644,6 +842,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
                                 selected: contact.deviceId == _selectedContact?.deviceId,
                                 online: _sessions.containsKey(contact.deviceId),
                                 onTap: () => setState(() => _selectedContact = contact),
+                                onRemove: () => _removeContact(contact),
                               ),
                           ],
                         ),
@@ -684,13 +883,17 @@ class _ConversationScreenState extends State<ConversationScreen> {
                     const Divider(height: 1, color: VaultXColors.border),
                     Expanded(
                       child: _selectedContact == null
-                          ? const _NoContactSelectedHint()
+                          ? _NoContactSelectedHint(onStartChat: _openAddContact)
                           : ListView(
                               padding: const EdgeInsets.all(14),
                               children: [
                                 for (final message
                                     in _messagesByContact[_selectedContact!.deviceId] ?? [])
-                                  _MessageLine(message: message),
+                                  _MessageLine(
+                                    message: message,
+                                    revealed: _revealedMessageIds.contains(message.id),
+                                    onToggleReveal: () => _toggleReveal(message.id),
+                                  ),
                               ],
                             ),
                     ),
@@ -735,24 +938,36 @@ class _ConversationScreenState extends State<ConversationScreen> {
 }
 
 class _NoContactSelectedHint extends StatelessWidget {
-  const _NoContactSelectedHint();
+  const _NoContactSelectedHint({required this.onStartChat});
+
+  final VoidCallback onStartChat;
 
   @override
   Widget build(BuildContext context) {
-    return const Center(
+    return Center(
       child: Padding(
-        padding: EdgeInsets.all(24),
-        child: Text(
-          '>> ADD A CONTACT TO START YOUR FIRST SECURE\n'
-          '   CONVERSATION. SHARE YOUR DEVICE ID (TAP\n'
-          '   "MY ID" ABOVE) WITH A FRIEND, THEN USE\n'
-          '   "+ ADD CONTACT" WITH THEIRS.',
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            color: VaultXColors.phosphorDim,
-            fontFamily: VaultXFonts.mono,
-            fontSize: 13,
-          ),
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              '>> ADD A CONTACT TO START YOUR FIRST SECURE\n'
+              '   CONVERSATION. SHARE YOUR DEVICE ID (TAP\n'
+              '   "MY ID" ABOVE) WITH A FRIEND, THEN USE\n'
+              '   "START CHAT" BELOW WITH THEIRS.\n\n'
+              '   ONLY ONE OF YOU SHOULD ADD THE OTHER —\n'
+              '   IF YOU BOTH DO IT AT THE SAME TIME, REMOVE\n'
+              '   THE CONTACT ([x] IN THE LIST) AND RETRY.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: VaultXColors.phosphorDim,
+                fontFamily: VaultXFonts.mono,
+                fontSize: 13,
+              ),
+            ),
+            const SizedBox(height: 20),
+            AsciiButton(label: 'Start Chat', onPressed: onStartChat),
+          ],
         ),
       ),
     );
@@ -765,12 +980,14 @@ class _ContactListTile extends StatelessWidget {
     required this.selected,
     required this.online,
     required this.onTap,
+    required this.onRemove,
   });
 
   final Contact contact;
   final bool selected;
   final bool online;
   final VoidCallback onTap;
+  final VoidCallback onRemove;
 
   @override
   Widget build(BuildContext context) {
@@ -792,6 +1009,18 @@ class _ContactListTile extends StatelessWidget {
               ),
             ),
             if (online) const StatusDot(),
+            const SizedBox(width: 8),
+            GestureDetector(
+              onTap: onRemove,
+              child: const Text(
+                '[x]',
+                style: TextStyle(
+                  color: VaultXColors.alertRed,
+                  fontFamily: VaultXFonts.mono,
+                  fontSize: 12,
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -800,9 +1029,15 @@ class _ContactListTile extends StatelessWidget {
 }
 
 class _MessageLine extends StatelessWidget {
-  const _MessageLine({required this.message});
+  const _MessageLine({
+    required this.message,
+    required this.revealed,
+    required this.onToggleReveal,
+  });
 
   final ChatMessage message;
+  final bool revealed;
+  final VoidCallback onToggleReveal;
 
   static String _formatSize(int bytes) {
     if (bytes < 1024) return '$bytes B';
@@ -841,7 +1076,22 @@ class _MessageLine extends StatelessWidget {
                 ? (TapGestureRecognizer()..onTap = _openFile)
                 : null,
           )
-        : TextSpan(text: message.text, style: const TextStyle(color: VaultXColors.phosphor));
+        : (revealed || message.cipherHex == null)
+              ? TextSpan(
+                  text: '${message.text}${message.cipherHex != null ? '  [tap to hide]' : ''}',
+                  style: const TextStyle(color: VaultXColors.phosphor),
+                  recognizer: message.cipherHex != null
+                      ? (TapGestureRecognizer()..onTap = onToggleReveal)
+                      : null,
+                )
+              : TextSpan(
+                  text: '🔒 ${message.cipherHex}',
+                  style: const TextStyle(
+                    color: VaultXColors.phosphorDim,
+                    fontStyle: FontStyle.italic,
+                  ),
+                  recognizer: TapGestureRecognizer()..onTap = onToggleReveal,
+                );
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
