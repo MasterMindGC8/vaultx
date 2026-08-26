@@ -16,6 +16,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -159,6 +160,23 @@ class _ConversationScreenState extends State<ConversationScreen> {
   final Set<String> _revealedMessageIds = {};
   final Map<String, Timer> _revealTimers = {};
 
+  // Fires on an actual window-close/exit request, *before* the window and
+  // engine are torn down — unlike State.dispose(), Flutter lets this one
+  // delay the real exit until the returned future completes, which is
+  // what makes the "burn history on close" send below actually reliable
+  // instead of a fire-and-forget race against process teardown. Only
+  // covers a normal close (Alt+F4, the X button, taskbar close); a forced
+  // kill (Task Manager, power loss) skips this like everything else.
+  AppLifecycleListener? _lifecycleListener;
+  bool _exitWipeDone = false;
+
+  // State.mounted stays true for the entire body of dispose() — it only
+  // flips after dispose() returns — but the framework still forbids
+  // calling setState() during that window regardless. `mounted` alone
+  // isn't enough to guard _wipeContactHistory's setState call from the
+  // dispose() fallback path below; this flag is.
+  bool _isDisposing = false;
+
   String _newMessageId() => '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
 
   @override
@@ -174,6 +192,34 @@ class _ConversationScreenState extends State<ConversationScreen> {
     }
     _selectedContact = _contacts.isNotEmpty ? _contacts.first : null;
     _connectToRelay();
+    _lifecycleListener = AppLifecycleListener(onExitRequested: _wipeAllOnExit);
+  }
+
+  /// Burns local chat history with every contact we still hold a session
+  /// with, and tells each peer (over that same encrypted session) to burn
+  /// theirs too — then holds real app exit open just long enough for
+  /// those sends to actually leave the socket before the window and
+  /// engine are destroyed. Idempotent: only runs once per screen
+  /// instance, since dispose() calls this too as a fallback for exit
+  /// paths that don't go through the lifecycle listener.
+  Future<AppExitResponse> _wipeAllOnExit() async {
+    if (_exitWipeDone) return AppExitResponse.exit;
+    _exitWipeDone = true;
+    // Logged but never awaited here: an `await` before the wipe loop below
+    // would yield control back to the event loop, letting dispose()'s
+    // later, synchronous vault.dispose() run *before* this resumes —
+    // exactly the bug this comment is here to stop someone reintroducing.
+    // Everything that touches the vault or a session must stay in this
+    // function's synchronous prefix, not after any await.
+    unawaited(AppLogger.info('exit-wipe triggered (${_contacts.length} contact(s))'));
+    final hadAnySession = _contacts.any((c) => _sessions.containsKey(c.deviceId));
+    for (final contact in _contacts) {
+      _wipeContactHistory(contact, notifyPeer: true);
+    }
+    if (hadAnySession) {
+      await Future.delayed(const Duration(milliseconds: 400));
+    }
+    return AppExitResponse.exit;
   }
 
   String _loadUpdateManifestUrl() {
@@ -350,8 +396,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
     for (final message in _messagesByContact[contact.deviceId] ?? const <ChatMessage>[]) {
       _revealTimers.remove(message.id)?.cancel();
       _revealedMessageIds.remove(message.id);
+      // Clearing the message list alone leaves any received file sitting
+      // untouched on disk under received_files/ — not actually "no
+      // traces" if a file was ever part of this conversation.
+      final path = message.filePath;
+      if (path != null) {
+        unawaited(File(path).delete().catchError((_) => File(path)));
+      }
     }
-    if (mounted) {
+    if (mounted && !_isDisposing) {
       setState(() => _messagesByContact[contact.deviceId] = []);
     } else {
       _messagesByContact[contact.deviceId] = [];
@@ -452,6 +505,14 @@ class _ConversationScreenState extends State<ConversationScreen> {
     _saveContacts();
   }
 
+  /// True only when the WebSocket to the relay is actually open. Both
+  /// message and file sends must check this *before* queuing anything —
+  /// `RelayStream.send` silently no-ops on a closed channel (see its own
+  /// doc), so without this check a send while offline (or one that drops
+  /// mid-transfer) looks identical, in the UI, to a successful one: no
+  /// error, message marked sent, but the peer never receives it.
+  bool get _isRelayConnected => _relayStream?.isConnected ?? false;
+
   Uint8List _sendEnvelope(Contact contact, NativeSession session, MessageEnvelope envelope) {
     final ciphertext = session.encrypt(envelope.encode());
     final packetId = _newMessageId();
@@ -470,6 +531,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
     final session = _sessions[contact.deviceId];
     if (session == null) {
       setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
+      return;
+    }
+    if (!_isRelayConnected) {
+      setState(() => _connectionStatus = 'OFFLINE — MESSAGE NOT SENT, RECONNECTING...');
+      AppLogger.warn('dropped outgoing text: relay not connected');
       return;
     }
     final ciphertext = _sendEnvelope(contact, session, TextEnvelope(text));
@@ -504,10 +570,29 @@ class _ConversationScreenState extends State<ConversationScreen> {
       setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
       return;
     }
+    if (!_isRelayConnected) {
+      setState(() => _connectionStatus = 'OFFLINE — CANNOT SEND FILE, RECONNECTING...');
+      await AppLogger.warn('dropped outgoing file: relay not connected');
+      return;
+    }
 
-    final result = await FilePicker.pickFiles(withData: true);
-    final picked = result?.files.single;
-    if (picked == null || picked.bytes == null) return;
+    FilePickerResult? result;
+    try {
+      result = await FilePicker.pickFiles(withData: true);
+    } catch (e) {
+      await AppLogger.error('file picker failed', e);
+      if (!mounted) return;
+      setState(() => _connectionStatus = 'FILE PICKER FAILED — SEE LOG');
+      return;
+    }
+    if (result == null || result.files.isEmpty) return;
+    final picked = result.files.first;
+    if (picked.bytes == null) {
+      await AppLogger.warn('picked file "${picked.name}" had no data (withData read failed)');
+      if (!mounted) return;
+      setState(() => _connectionStatus = 'COULD NOT READ THAT FILE — TRY AGAIN');
+      return;
+    }
 
     final bytes = picked.bytes!;
     final chunks = splitIntoChunks(bytes);
@@ -525,6 +610,18 @@ class _ConversationScreenState extends State<ConversationScreen> {
       ),
     );
     for (var i = 0; i < chunks.length; i++) {
+      // Checked every chunk, not just once up front: a large file takes
+      // real time to send across many packets, and the connection can
+      // drop partway through — abort and say so clearly rather than
+      // silently "finishing" a transfer the peer only received part of.
+      if (!_isRelayConnected) {
+        await AppLogger.warn(
+          'relay disconnected mid-file-send: ${picked.name} (chunk $i/${chunks.length})',
+        );
+        if (!mounted) return;
+        setState(() => _connectionStatus = 'OFFLINE — FILE SEND INTERRUPTED');
+        return;
+      }
       _sendEnvelope(
         contact,
         session,
@@ -736,20 +833,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   @override
   void dispose() {
-    // Explicit app close: burn this device's chat history with every
-    // contact we still hold an active session with, and tell each peer
-    // (over their own already-established encrypted session) to burn
-    // their copy too. Best effort only — sent fire-and-forget over an
-    // already-open socket right before it closes, so it covers a normal
-    // window close but not a forced kill (task manager, power loss),
-    // which never runs this at all.
-    for (final contact in _contacts) {
-      final session = _sessions[contact.deviceId];
-      if (session != null) {
-        _sendEnvelope(contact, session, WipeEnvelope());
-      }
-      widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode('[]'));
-    }
+    _isDisposing = true;
+    // Fallback only — _wipeAllOnExit is guarded by _exitWipeDone, so this
+    // is a no-op on the normal path (already ran, and got to actually
+    // delay exit for the sends to flush, via the lifecycle listener
+    // above). Still calling it here covers screen teardown that isn't a
+    // real app exit at all (e.g. hot reload/navigation in dev), where
+    // skipping it would leave history sitting un-burned.
+    unawaited(_wipeAllOnExit());
+    _lifecycleListener?.dispose();
     for (final timer in _revealTimers.values) {
       timer.cancel();
     }

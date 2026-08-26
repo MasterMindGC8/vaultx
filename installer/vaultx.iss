@@ -8,7 +8,7 @@
 ; silently re-runs this installer.
 #define MyAppId "{{A7C93F1E-2B4D-4E11-9C2A-8F1D6E4B7A31}"
 #define MyAppName "Vault X"
-#define MyAppVersion "1.6.2"
+#define MyAppVersion "1.6.3"
 #define MyAppPublisher "Vault X Project"
 #define MyAppExeName "client_app.exe"
 #define ReleaseDir "..\client_app\build\windows\x64\runner\Release"
