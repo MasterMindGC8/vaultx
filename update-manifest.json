@@ -1,17 +1,17 @@
 {
   "windows": {
-    "version": "1.6.3",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.3/VaultXSetup-1.6.3.exe",
-    "notes": "Fixed: sending a message or file while offline (or a connection dropping mid-transfer) used to silently look successful. Fixed: burn-on-close (deleting a chat for both people when one of you closes the app) is now much more reliable, and now also deletes any files that were part of that conversation."
+    "version": "1.6.4",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.4/VaultXSetup-1.6.4.exe",
+    "notes": "Added drag-and-drop file sending — drop any file onto the chat window to send it. Fixed an installer issue where a newly added plugin's file could be missing."
   },
   "macos": {
-    "version": "1.6.3",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.3/VaultX-macOS.zip",
-    "notes": "Fixed: sending a message or file while offline (or a connection dropping mid-transfer) used to silently look successful. Fixed: burn-on-close (deleting a chat for both people when one of you closes the app) is now much more reliable, and now also deletes any files that were part of that conversation. Unsigned build — right-click the app and choose Open the first time to get past Gatekeeper."
+    "version": "1.6.4",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.4/VaultX-macOS.zip",
+    "notes": "Added drag-and-drop file sending — drop any file onto the chat window to send it. Unsigned build — right-click the app and choose Open the first time to get past Gatekeeper."
   },
   "linux": {
-    "version": "1.6.3",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.3/VaultX-linux-x86_64.tar.gz",
-    "notes": "Fixed: sending a message or file while offline (or a connection dropping mid-transfer) used to silently look successful. Fixed: burn-on-close (deleting a chat for both people when one of you closes the app) is now much more reliable, and now also deletes any files that were part of that conversation. Extract the tarball and run the client_app executable inside bundle/."
+    "version": "1.6.4",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.4/VaultX-linux-x86_64.tar.gz",
+    "notes": "Added drag-and-drop file sending — drop any file onto the chat window to send it. Extract the tarball and run the client_app executable inside bundle/."
   }
 }
