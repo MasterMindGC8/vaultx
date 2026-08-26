@@ -8,7 +8,7 @@
 ; silently re-runs this installer.
 #define MyAppId "{{A7C93F1E-2B4D-4E11-9C2A-8F1D6E4B7A31}"
 #define MyAppName "Vault X"
-#define MyAppVersion "1.6.3"
+#define MyAppVersion "1.6.4"
 #define MyAppPublisher "Vault X Project"
 #define MyAppExeName "client_app.exe"
 #define ReleaseDir "..\client_app\build\windows\x64\runner\Release"
@@ -40,8 +40,11 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 Source: "{#ReleaseDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#ReleaseDir}\crypto_core.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#ReleaseDir}\flutter_windows.dll"; DestDir: "{app}"; Flags: ignoreversion
+; Wildcarded rather than named one by one: bundles crypto_core.dll,
+; flutter_windows.dll, and every native plugin DLL (e.g.
+; desktop_drop_plugin.dll) the build produces, present or future, instead
+; of silently missing a newly-added plugin's DLL and crashing on install.
+Source: "{#ReleaseDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ReleaseDir}\native_assets.yaml"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#ReleaseDir}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall

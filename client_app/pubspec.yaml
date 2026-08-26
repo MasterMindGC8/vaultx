@@ -2,7 +2,7 @@ name: client_app
 description: "Vault X — zero-knowledge, post-quantum encrypted messenger. Matrix terminal client."
 publish_to: 'none'
 
-version: 1.6.3+13
+version: 1.6.4+14
 
 environment:
   sdk: ^3.6.0
@@ -21,6 +21,8 @@ dependencies:
   package_info_plus: ^9.0.1
   path_provider: ^2.1.5
   file_picker: ^11.0.3
+  desktop_drop: ^0.8.2
+  cross_file: ^0.3.4+2
 
 dev_dependencies:
   flutter_test:

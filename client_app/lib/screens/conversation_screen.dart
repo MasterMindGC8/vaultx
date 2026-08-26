@@ -22,6 +22,8 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:cross_file/cross_file.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -176,6 +178,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
   // isn't enough to guard _wipeContactHistory's setState call from the
   // dispose() fallback path below; this flag is.
   bool _isDisposing = false;
+
+  // True while a drag-and-drop file is hovering over the conversation
+  // panel — purely a visual cue (see the overlay in build()); the actual
+  // drop is handled by _sendDroppedFiles.
+  bool _isDragHovering = false;
 
   String _newMessageId() => '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
 
@@ -563,18 +570,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
   /// per-chunk one, since the relay never sees more than one chunk at a
   /// time and never reassembles anything itself.
   Future<void> _sendFile() async {
-    final contact = _selectedContact;
-    if (contact == null) return;
-    final session = _sessions[contact.deviceId];
-    if (session == null) {
-      setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
-      return;
-    }
-    if (!_isRelayConnected) {
-      setState(() => _connectionStatus = 'OFFLINE — CANNOT SEND FILE, RECONNECTING...');
-      await AppLogger.warn('dropped outgoing file: relay not connected');
-      return;
-    }
+    if (_selectedContact == null) return;
 
     FilePickerResult? result;
     try {
@@ -593,18 +589,58 @@ class _ConversationScreenState extends State<ConversationScreen> {
       setState(() => _connectionStatus = 'COULD NOT READ THAT FILE — TRY AGAIN');
       return;
     }
+    await _sendFileBytes(picked.name, picked.bytes!);
+  }
 
-    final bytes = picked.bytes!;
+  /// Sends files dropped onto the conversation via drag-and-drop —
+  /// dropping onto any part of this screen sends to whichever contact is
+  /// currently selected, same as tapping "Attach". Reads each file fully
+  /// into memory up front (matches FilePicker's `withData: true` above),
+  /// which is fine at chat-attachment scale but would need streaming for
+  /// arbitrarily huge drops.
+  Future<void> _sendDroppedFiles(List<XFile> files) async {
+    if (_selectedContact == null) return;
+    for (final file in files) {
+      Uint8List bytes;
+      try {
+        bytes = await file.readAsBytes();
+      } catch (e) {
+        await AppLogger.error('failed to read dropped file "${file.name}"', e);
+        if (!mounted) return;
+        setState(() => _connectionStatus = 'COULD NOT READ DROPPED FILE — TRY AGAIN');
+        continue;
+      }
+      await _sendFileBytes(file.name, bytes);
+    }
+  }
+
+  /// Shared send path for both the file picker and drag-and-drop: splits,
+  /// encrypts, and relays [bytes] as [name] to the currently selected
+  /// contact.
+  Future<void> _sendFileBytes(String name, Uint8List bytes) async {
+    final contact = _selectedContact;
+    if (contact == null) return;
+    final session = _sessions[contact.deviceId];
+    if (session == null) {
+      setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
+      return;
+    }
+    if (!_isRelayConnected) {
+      setState(() => _connectionStatus = 'OFFLINE — CANNOT SEND FILE, RECONNECTING...');
+      await AppLogger.warn('dropped outgoing file: relay not connected');
+      return;
+    }
+
     final chunks = splitIntoChunks(bytes);
     final transferId = '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
 
-    setState(() => _connectionStatus = 'SENDING ${picked.name}...');
+    setState(() => _connectionStatus = 'SENDING $name...');
     _sendEnvelope(
       contact,
       session,
       FileOfferEnvelope(
         id: transferId,
-        name: picked.name,
+        name: name,
         size: bytes.length,
         chunkCount: chunks.length,
       ),
@@ -616,7 +652,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       // silently "finishing" a transfer the peer only received part of.
       if (!_isRelayConnected) {
         await AppLogger.warn(
-          'relay disconnected mid-file-send: ${picked.name} (chunk $i/${chunks.length})',
+          'relay disconnected mid-file-send: $name (chunk $i/${chunks.length})',
         );
         if (!mounted) return;
         setState(() => _connectionStatus = 'OFFLINE — FILE SEND INTERRUPTED');
@@ -637,7 +673,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
           id: _newMessageId(),
           fromSelf: true,
           sentAt: DateTime.now(),
-          fileName: picked.name,
+          fileName: name,
           fileSize: bytes.length,
         ),
       );
@@ -950,82 +986,122 @@ class _ConversationScreenState extends State<ConversationScreen> {
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: TerminalPanel(
-                title: _selectedContact == null
-                    ? 'terminal // no contact selected'
-                    : 'terminal // ${_selectedContact!.label}',
-                padding: EdgeInsets.zero,
-                expandContent: true,
-                child: Column(
+              child: DropTarget(
+                onDragEntered: (_) => setState(() => _isDragHovering = true),
+                onDragExited: (_) => setState(() => _isDragHovering = false),
+                onDragDone: (details) {
+                  setState(() => _isDragHovering = false);
+                  _sendDroppedFiles(details.files);
+                },
+                child: Stack(
                   children: [
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                      // Wrap rather than Row: two badges plus three buttons
-                      // need ~1150px to fit on one line, wider than this
-                      // panel gets once the window is resized down or the
-                      // sidebar is open — Row would silently overflow off
-                      // the right edge (only visible as a debug-mode
-                      // warning stripe, never a crash, so easy to miss).
-                      // Wrap instead lets buttons flow onto a second line.
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        crossAxisAlignment: WrapCrossAlignment.center,
+                    TerminalPanel(
+                      title: _selectedContact == null
+                          ? 'terminal // no contact selected'
+                          : 'terminal // ${_selectedContact!.label}',
+                      padding: EdgeInsets.zero,
+                      expandContent: true,
+                      child: Column(
                         children: [
-                          const CipherBadge(label: 'ENC: CHACHA20-POLY1305'),
-                          const CipherBadge(label: 'POST-QUANTUM: ENABLED'),
-                          AsciiButton(label: 'My ID', onPressed: _copyMyId),
-                          AsciiButton(label: 'Updates', onPressed: _checkForUpdates),
-                          AsciiButton(label: 'View Log', onPressed: _openLog),
-                        ],
-                      ),
-                    ),
-                    const Divider(height: 1, color: VaultXColors.border),
-                    Expanded(
-                      child: _selectedContact == null
-                          ? _NoContactSelectedHint(onStartChat: _openAddContact)
-                          : ListView(
-                              padding: const EdgeInsets.all(14),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                            // Wrap rather than Row: two badges plus three
+                            // buttons need ~1150px to fit on one line, wider
+                            // than this panel gets once the window is
+                            // resized down or the sidebar is open — Row
+                            // would silently overflow off the right edge
+                            // (only visible as a debug-mode warning stripe,
+                            // never a crash, so easy to miss). Wrap instead
+                            // lets buttons flow onto a second line.
+                            child: Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              crossAxisAlignment: WrapCrossAlignment.center,
                               children: [
-                                for (final message
-                                    in _messagesByContact[_selectedContact!.deviceId] ?? [])
-                                  _MessageLine(
-                                    message: message,
-                                    revealed: _revealedMessageIds.contains(message.id),
-                                    onToggleReveal: () => _toggleReveal(message.id),
-                                  ),
+                                const CipherBadge(label: 'ENC: CHACHA20-POLY1305'),
+                                const CipherBadge(label: 'POST-QUANTUM: ENABLED'),
+                                AsciiButton(label: 'My ID', onPressed: _copyMyId),
+                                AsciiButton(label: 'Updates', onPressed: _checkForUpdates),
+                                AsciiButton(label: 'View Log', onPressed: _openLog),
                               ],
                             ),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: const BoxDecoration(
-                        border: Border(top: BorderSide(color: VaultXColors.border)),
-                      ),
-                      child: Row(
-                        children: [
+                          ),
+                          const Divider(height: 1, color: VaultXColors.border),
                           Expanded(
-                            child: TerminalTextField(
-                              controller: _composerController,
-                              hintText: _selectedContact == null
-                                  ? 'select a contact first...'
-                                  : 'type a message...',
-                              onSubmitted: (_) => _sendMessage(),
+                            child: _selectedContact == null
+                                ? _NoContactSelectedHint(onStartChat: _openAddContact)
+                                : ListView(
+                                    padding: const EdgeInsets.all(14),
+                                    children: [
+                                      for (final message
+                                          in _messagesByContact[_selectedContact!.deviceId] ??
+                                              [])
+                                        _MessageLine(
+                                          message: message,
+                                          revealed: _revealedMessageIds.contains(message.id),
+                                          onToggleReveal: () => _toggleReveal(message.id),
+                                        ),
+                                    ],
+                                  ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: const BoxDecoration(
+                              border: Border(top: BorderSide(color: VaultXColors.border)),
                             ),
-                          ),
-                          const SizedBox(width: 8),
-                          AsciiButton(
-                            label: 'Attach',
-                            onPressed: _selectedContact == null ? null : _sendFile,
-                          ),
-                          const SizedBox(width: 8),
-                          AsciiButton(
-                            label: 'Send',
-                            onPressed: _selectedContact == null ? null : _sendMessage,
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: TerminalTextField(
+                                    controller: _composerController,
+                                    hintText: _selectedContact == null
+                                        ? 'select a contact first...'
+                                        : 'type a message, or drag & drop a file...',
+                                    onSubmitted: (_) => _sendMessage(),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                AsciiButton(
+                                  label: 'Attach',
+                                  onPressed: _selectedContact == null ? null : _sendFile,
+                                ),
+                                const SizedBox(width: 8),
+                                AsciiButton(
+                                  label: 'Send',
+                                  onPressed: _selectedContact == null ? null : _sendMessage,
+                                ),
+                              ],
+                            ),
                           ),
                         ],
                       ),
                     ),
+                    // Hover overlay while a drag is over this panel — the
+                    // only visual feedback that anything will happen if
+                    // the file is dropped here, since otherwise a drop
+                    // target is entirely invisible until you release.
+                    if (_isDragHovering)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: VaultXColors.phosphor.withValues(alpha: 0.08),
+                              border: Border.all(color: VaultXColors.phosphor, width: 2),
+                            ),
+                            child: const Center(
+                              child: Text(
+                                '[ DROP FILE TO SEND ]',
+                                style: TextStyle(
+                                  color: VaultXColors.phosphor,
+                                  fontFamily: VaultXFonts.mono,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                   ],
                 ),
               ),
