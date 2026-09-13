@@ -3,6 +3,11 @@ name = "crypto_core"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [lib]
 # rlib for Rust-side tests/consumers, cdylib for the Flutter/Dart FFI bridge
 # (see src/ffi.rs and client_app/lib/bridge/native_crypto.dart).

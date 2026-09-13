@@ -63,9 +63,12 @@ ThemeData buildVaultXThemeData() {
 /// Mount once, near the root of the app (see `main.dart`), so every screen
 /// underneath renders through the same tube.
 class CrtOverlay extends StatefulWidget {
-  const CrtOverlay({super.key, required this.child});
+  const CrtOverlay({super.key, required this.child, this.animated = false});
 
   final Widget child;
+  /// Static CRT styling is the lightweight default. Ambient flicker should
+  /// not schedule a full-window shader repaint every frame while idle.
+  final bool animated;
 
   @override
   State<CrtOverlay> createState() => _CrtOverlayState();
@@ -81,7 +84,15 @@ class _CrtOverlayState extends State<CrtOverlay>
     super.initState();
     _ticker = createTicker((elapsed) {
       setState(() => _elapsedSeconds = elapsed.inMicroseconds / 1e6);
-    })..start();
+    });
+    if (widget.animated) _ticker.start();
+  }
+
+  @override
+  void didUpdateWidget(CrtOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.animated && !_ticker.isActive) _ticker.start();
+    if (!widget.animated && _ticker.isActive) _ticker.stop();
   }
 
   @override

@@ -26,3 +26,13 @@
 
 # Cross-compiled relay binary, built on demand (not source)
 /transport_relay/relay_linux_amd64
+
+# Local SDKs, synthetic test profiles, and application backups
+/.tools/
+/.audit/
+/Backups/
+/tooling/Install-Local-Update.ps1
+/tooling/Package-Windows.ps1
+/tooling/Build-Windows.ps1
+/tooling/prepare_flutter.py
+/LOCAL-UPDATE.md

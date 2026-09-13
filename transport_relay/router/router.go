@@ -58,6 +58,20 @@ type client struct {
 	deviceID string
 	conn     *websocket.Conn
 	send     chan envelope
+	wake     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+func (c *client) stop() {
+	c.stopOnce.Do(func() { close(c.done); _ = c.conn.Close() })
+}
+
+func (c *client) notify() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 // envelope is the WebSocket wire format. `Payload` is opaque
@@ -122,7 +136,8 @@ func (h *Hub) HandleStream(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // upgrader already wrote the HTTP error response
 	}
-	conn.SetReadLimit(maxPacketPayloadBytes + 4096)
+	conn.SetReadLimit((maxPacketPayloadBytes * 4 / 3) + 8192)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 	var hello envelope
 	if err := conn.ReadJSON(&hello); err != nil || hello.Type != "hello" || hello.Sender == "" {
@@ -131,28 +146,31 @@ func (h *Hub) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := hello.Sender
+	_ = conn.SetReadDeadline(time.Time{})
 
-	c := &client{deviceID: deviceID, conn: conn, send: make(chan envelope, 32)}
+	c := &client{deviceID: deviceID, conn: conn, send: make(chan envelope, 32),
+		wake: make(chan struct{}, 1), done: make(chan struct{})}
 	h.register(c)
 	defer h.unregister(c)
 
 	writerDone := make(chan struct{})
 	go h.writePump(c, writerDone)
 
-	// Flush anything that queued up while this device was offline.
-	for _, p := range h.Queue.Drain(deviceID) {
-		c.send <- envelope{Type: "deliver", PacketID: p.ID, Sender: p.Sender, Payload: p.Payload}
-	}
+	c.notify()
 
 	h.readPump(c)
-	close(c.send)
+	c.stop()
 	<-writerDone
 }
 
 func (h *Hub) register(c *client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	previous := h.clients[c.deviceID]
 	h.clients[c.deviceID] = c
+	h.mu.Unlock()
+	if previous != nil {
+		previous.stop()
+	}
 }
 
 func (h *Hub) unregister(c *client) {
@@ -165,10 +183,32 @@ func (h *Hub) unregister(c *client) {
 
 func (h *Hub) writePump(c *client, done chan struct{}) {
 	defer close(done)
-	for env := range c.send {
+	defer c.stop()
+	var cursor uint64
+	write := func(env envelope) bool {
 		_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := c.conn.WriteJSON(env); err != nil {
+		return c.conn.WriteJSON(env) == nil
+	}
+	for {
+		select {
+		case <-c.done:
 			return
+		case env := <-c.send:
+			if !write(env) {
+				return
+			}
+		case <-c.wake:
+			for _, p := range h.Queue.PendingAfter(c.deviceID, cursor) {
+				select {
+				case <-c.done:
+					return
+				default:
+				}
+				if !write(envelope{Type: "deliver", PacketID: p.ID, Sender: p.Sender, Payload: p.Payload}) {
+					return
+				}
+				cursor = p.Sequence
+			}
 		}
 	}
 }
@@ -181,16 +221,23 @@ func (h *Hub) readPump(c *client) {
 		}
 		switch env.Type {
 		case "send":
-			if env.Recipient == "" || env.PacketID == "" {
+			if env.Recipient == "" || env.PacketID == "" || len(env.Payload) > maxPacketPayloadBytes {
 				continue
 			}
-			h.deliverOrQueue(&queue.Packet{
+			accepted := h.deliverOrQueue(&queue.Packet{
 				ID:        env.PacketID,
 				Sender:    c.deviceID,
 				Recipient: env.Recipient,
 				Payload:   env.Payload,
 				QueuedAt:  time.Now(),
 			})
+			if !accepted {
+				select {
+				case c.send <- envelope{Type: "error", PacketID: env.PacketID, Message: "relay queue full"}:
+				case <-c.done:
+					return
+				}
+			}
 		case "ack":
 			if env.PacketID != "" {
 				h.Queue.Ack(c.deviceID, env.PacketID)
@@ -204,22 +251,18 @@ func (h *Hub) readPump(c *client) {
 	}
 }
 
-// deliverOrQueue hands a packet straight to its recipient if they're
-// currently connected and keeping up; otherwise it falls back to the
-// ephemeral RAM queue for delivery on next connect.
-func (h *Hub) deliverOrQueue(p *queue.Packet) {
+// deliverOrQueue retains a packet until ACK/expiry and wakes an online
+// recipient's writer. Offline recipients receive it on their next connection.
+func (h *Hub) deliverOrQueue(p *queue.Packet) bool {
+	if !h.Queue.Enqueue(p) {
+		return false
+	}
 	h.mu.Lock()
 	recipient, online := h.clients[p.Recipient]
 	h.mu.Unlock()
 
 	if online {
-		select {
-		case recipient.send <- envelope{Type: "deliver", PacketID: p.ID, Sender: p.Sender, Payload: p.Payload}:
-			return
-		default:
-			// Recipient's outbound buffer is full (slow consumer) — queue
-			// instead of blocking this goroutine or dropping the packet.
-		}
+		recipient.notify()
 	}
-	h.Queue.Enqueue(p)
+	return true
 }
