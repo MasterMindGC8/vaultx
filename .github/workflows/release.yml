@@ -1,10 +1,7 @@
 name: Build and attach release binaries
 
-# Builds macOS and Linux binaries on GitHub's own runners — Windows is
-# still built and released manually (see dist/README.txt), since Inno
-# Setup + the local dev flow already covers it well. This exists because
-# neither macOS nor Linux can be honestly cross-compiled/verified from a
-# Windows machine (no Xcode, no real Linux GTK toolchain).
+# Builds Windows, macOS and Linux binaries on their native GitHub runners.
+# Keep the target release in draft until every job and artifact is verified.
 #
 # Triggered by pushing a tag (vX.Y.Z) that already has a matching GitHub
 # Release (create it first, e.g. `gh release create vX.Y.Z ...`) — each
@@ -38,6 +35,7 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.47.4'
           channel: stable
 
       - name: Build crypto_core for both Apple architectures
@@ -128,8 +126,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: transport_relay/go.mod
+          cache-dependency-path: transport_relay/go.sum
+
+      - name: Test relay with race detector
+        working-directory: transport_relay
+        run: go test -race ./...
+
       - uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.47.4'
           channel: stable
 
       - name: Build crypto_core
@@ -197,3 +205,114 @@ jobs:
           gh release upload "${{ steps.tag.outputs.tag }}" \
             "client_app/build/linux/x64/release/VaultX-linux-x86_64.tar.gz" \
             --clobber --repo "${{ github.repository }}"
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: transport_relay/go.mod
+          cache-dependency-path: transport_relay/go.sum
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+
+      - name: Test and build native crypto
+        working-directory: crypto_core
+        run: |
+          cargo test --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --lib --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build isolated test relay
+        working-directory: transport_relay
+        run: |
+          go build -o "$env:RUNNER_TEMP\vaultx-relay-test.exe" .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Analyze and test client with encrypted loopback transfers
+        working-directory: client_app
+        run: |
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          flutter analyze --no-pub
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = (Resolve-Path '..\crypto_core\target\release').Path + ';' + $env:PATH
+          $env:VAULTX_DATA_DIR = Join-Path $env:RUNNER_TEMP ('vaultx-tests-' + [guid]::NewGuid().ToString('N'))
+          $env:VAULTX_RELAY_ADDR = '127.0.0.1:18443'
+          $env:VAULTX_TEST_RELAY = 'http://127.0.0.1:18443'
+          New-Item -ItemType Directory -Path $env:VAULTX_DATA_DIR | Out-Null
+          $relay = Start-Process -FilePath "$env:RUNNER_TEMP\vaultx-relay-test.exe" -WindowStyle Hidden -PassThru
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              try {
+                $connection = [Net.Sockets.TcpClient]::new('127.0.0.1', 18443)
+                $connection.Dispose()
+                $ready = $true
+                break
+              } catch { Start-Sleep -Milliseconds 200 }
+            }
+            if (-not $ready) { throw 'Test relay did not start' }
+            flutter test --no-pub --reporter expanded --concurrency=1
+            if ($LASTEXITCODE -ne 0) { throw 'Client tests failed' }
+          } finally {
+            if (-not $relay.HasExited) { Stop-Process -Id $relay.Id }
+          }
+
+      - name: Build Windows release
+        working-directory: client_app
+        run: |
+          flutter build windows --release --no-pub
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test isolated Windows app
+        run: |
+          $env:VAULTX_DATA_DIR = Join-Path $env:RUNNER_TEMP ('vaultx-startup-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $env:VAULTX_DATA_DIR | Out-Null
+          $binary = (Resolve-Path 'client_app\build\windows\x64\runner\Release\client_app.exe').Path
+          $app = Start-Process -FilePath $binary -WorkingDirectory (Split-Path $binary) -WindowStyle Hidden -PassThru
+          try {
+            Start-Sleep -Seconds 5
+            $app.Refresh()
+            if ($app.HasExited) { throw 'Vault X exited during startup smoke test' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id }
+          }
+
+      - name: Download and verify Microsoft runtime installer
+        run: |
+          Invoke-WebRequest 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile 'installer\vc_redist.x64.exe'
+          $signature = Get-AuthenticodeSignature 'installer\vc_redist.x64.exe'
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            throw 'Microsoft runtime installer signature verification failed'
+          }
+
+      - name: Build installer
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $compiler)) { throw 'Inno Setup compiler is missing from the Windows runner' }
+          & $compiler 'installer\vaultx.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows installer and checksum
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Unexpected release tag' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          $installer = "dist\VaultXSetup-$version.exe"
+          if (-not (Test-Path -LiteralPath $installer)) { throw 'Installer version does not match release tag' }
+          $checksum = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  VaultXSetup-$version.exe" | Set-Content -LiteralPath "$installer.sha256" -Encoding utf8
+          gh release upload $env:RELEASE_TAG $installer "$installer.sha256"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

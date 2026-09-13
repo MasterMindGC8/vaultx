@@ -9,6 +9,7 @@
 package queue
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -22,6 +23,7 @@ type Packet struct {
 	Recipient string
 	Payload   []byte
 	QueuedAt  time.Time
+	Sequence  uint64
 }
 
 // DefaultTTL bounds how long an undelivered packet is held before it is
@@ -31,9 +33,12 @@ const DefaultTTL = 14 * 24 * time.Hour
 
 // RAMQueue holds undelivered packets per recipient, entirely in memory.
 type RAMQueue struct {
-	mu   sync.Mutex
-	byID map[string]map[string]*Packet // recipient device ID -> packet ID -> packet
-	ttl  time.Duration
+	mu       sync.Mutex
+	byID     map[string]map[string]*Packet // recipient device ID -> packet ID -> packet
+	ttl      time.Duration
+	sequence uint64
+	bytes    int
+	count    int
 }
 
 func New(ttl time.Duration) *RAMQueue {
@@ -44,15 +49,44 @@ func New(ttl time.Duration) *RAMQueue {
 }
 
 // Enqueue buffers a packet for later delivery.
-func (q *RAMQueue) Enqueue(p *Packet) {
+func (q *RAMQueue) Enqueue(p *Packet) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	bucket, ok := q.byID[p.Recipient]
+	if ok && bucket[p.ID] != nil {
+		return true
+	}
+	// TTL alone does not bound a flood or an offline recipient's backlog.
+	if q.bytes+len(p.Payload) > 256*1024*1024 || q.count >= 8192 {
+		return false
+	}
 	if !ok {
 		bucket = make(map[string]*Packet)
 		q.byID[p.Recipient] = bucket
 	}
-	bucket[p.ID] = p
+	q.sequence++
+	copyPacket := *p
+	copyPacket.Sequence = q.sequence
+	bucket[p.ID] = &copyPacket
+	q.bytes += len(p.Payload)
+	q.count++
+	return true
+}
+
+// PendingAfter snapshots packets in arrival order WITHOUT deleting them.
+// A connection keeps its own cursor. Reconnecting starts from zero so only
+// packets still awaiting an application ACK are replayed.
+func (q *RAMQueue) PendingAfter(recipient string, sequence uint64) []*Packet {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []*Packet
+	for _, p := range q.byID[recipient] {
+		if p.Sequence > sequence && time.Since(p.QueuedAt) <= q.ttl {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Sequence < out[j].Sequence })
+	return out
 }
 
 // Drain removes and returns every packet currently queued for recipient, in
@@ -68,6 +102,8 @@ func (q *RAMQueue) Drain(recipient string) []*Packet {
 	out := make([]*Packet, 0, len(bucket))
 	for _, p := range bucket {
 		out = append(out, p)
+		q.bytes -= len(p.Payload)
+		q.count--
 	}
 	delete(q.byID, recipient)
 	return out
@@ -76,15 +112,8 @@ func (q *RAMQueue) Drain(recipient string) []*Packet {
 // Requeue puts packets back (e.g. the recipient disconnected before ACKing
 // them).
 func (q *RAMQueue) Requeue(packets []*Packet) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
 	for _, p := range packets {
-		bucket, ok := q.byID[p.Recipient]
-		if !ok {
-			bucket = make(map[string]*Packet)
-			q.byID[p.Recipient] = bucket
-		}
-		bucket[p.ID] = p
+		q.Enqueue(p)
 	}
 }
 
@@ -95,6 +124,10 @@ func (q *RAMQueue) Ack(recipient, packetID string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if bucket, ok := q.byID[recipient]; ok {
+		if p := bucket[packetID]; p != nil {
+			q.bytes -= len(p.Payload)
+			q.count--
+		}
 		delete(bucket, packetID)
 		if len(bucket) == 0 {
 			delete(q.byID, recipient)
@@ -113,6 +146,8 @@ func (q *RAMQueue) SweepExpired() int {
 	for recipient, bucket := range q.byID {
 		for id, p := range bucket {
 			if now.Sub(p.QueuedAt) > q.ttl {
+				q.bytes -= len(p.Payload)
+				q.count--
 				delete(bucket, id)
 				removed++
 			}

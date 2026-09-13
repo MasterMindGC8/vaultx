@@ -5,7 +5,7 @@
 // session/relay plumbing (see conversation_screen.dart) instead of needing
 // a second channel.
 //
-// Files of any size are supported by splitting them into many
+// Files up to maxIncomingFileBytes are split into many
 // [FileChunkEnvelope]s, each individually ratchet-encrypted and relayed as
 // its own packet under the relay's per-packet size cap (see
 // transport_relay/router/router.go's maxPacketPayloadBytes) — the relay
@@ -18,6 +18,28 @@ import 'dart:typed_data';
 /// the relay's JSON envelope, comfortably clears the relay's per-packet
 /// cap with room to spare.
 const fileChunkSize = 400 * 1024;
+
+// The receiver currently keeps chunks in memory. Bound this until encrypted
+// disk spooling is implemented; never advertise unlimited file size.
+const maxIncomingFileBytes = 64 * 1024 * 1024;
+
+void validateFileMetadata(String name, int size, int chunkCount) {
+  if (name.isEmpty ||
+      name.length > 240 ||
+      RegExp(r'[<>:"/\\|?*\x00-\x1f]').hasMatch(name) ||
+      name.endsWith('.') ||
+      name.endsWith(' ') ||
+      RegExp(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)',
+              caseSensitive: false)
+          .hasMatch(name)) {
+    throw const FormatException('Unsupported filename');
+  }
+  final expected = size == 0 ? 1 : (size + fileChunkSize - 1) ~/ fileChunkSize;
+  if (size < 0 || size > maxIncomingFileBytes || chunkCount != expected) {
+    throw const FormatException(
+        'Invalid file size or chunk count (limit: 64 MiB)');
+  }
+}
 
 sealed class MessageEnvelope {
   Map<String, dynamic> toJson();
@@ -32,6 +54,7 @@ sealed class MessageEnvelope {
           name: json['name'] as String,
           size: json['size'] as int,
           chunkCount: json['chunks'] as int,
+          receipts: json['receipts'] == true,
         );
       case 'file_chunk':
         return FileChunkEnvelope(
@@ -41,6 +64,11 @@ sealed class MessageEnvelope {
         );
       case 'file_done':
         return FileDoneEnvelope(json['id'] as String);
+      case 'file_receipt':
+        return FileReceiptEnvelope(
+            id: json['id'] as String,
+            bytes: json['bytes'] as int,
+            stage: json['stage'] as String);
       case 'wipe':
         return WipeEnvelope();
       default:
@@ -70,20 +98,42 @@ class FileOfferEnvelope extends MessageEnvelope {
     required this.name,
     required this.size,
     required this.chunkCount,
+    this.receipts = false,
   });
 
   final String id;
   final String name;
   final int size;
   final int chunkCount;
+  final bool receipts;
 
   @override
+  Map<String, dynamic> toJson() => {
+        't': 'file_offer',
+        'id': id,
+        'name': name,
+        'size': size,
+        'chunks': chunkCount,
+        if (receipts) 'receipts': true
+      };
+}
+
+/// Only sent when the offer explicitly requests receipts. Old clients ignore
+/// the optional offer field and never receive an unknown envelope type.
+class FileReceiptEnvelope extends MessageEnvelope {
+  FileReceiptEnvelope(
+      {required this.id, required this.bytes, required this.stage});
+  final String id;
+  final int bytes;
+  final String stage;
+  @override
   Map<String, dynamic> toJson() =>
-      {'t': 'file_offer', 'id': id, 'name': name, 'size': size, 'chunks': chunkCount};
+      {'t': 'file_receipt', 'id': id, 'bytes': bytes, 'stage': stage};
 }
 
 class FileChunkEnvelope extends MessageEnvelope {
-  FileChunkEnvelope({required this.id, required this.index, required this.data});
+  FileChunkEnvelope(
+      {required this.id, required this.index, required this.data});
 
   final String id;
   final int index;
@@ -120,34 +170,85 @@ class WipeEnvelope extends MessageEnvelope {
 List<Uint8List> splitIntoChunks(Uint8List bytes) {
   final chunks = <Uint8List>[];
   for (var offset = 0; offset < bytes.length; offset += fileChunkSize) {
-    final end = (offset + fileChunkSize < bytes.length) ? offset + fileChunkSize : bytes.length;
+    final end = (offset + fileChunkSize < bytes.length)
+        ? offset + fileChunkSize
+        : bytes.length;
     chunks.add(Uint8List.sublistView(bytes, offset, end));
   }
-  if (chunks.isEmpty) chunks.add(Uint8List(0)); // an empty file is still one (empty) chunk
+  if (chunks.isEmpty) {
+    chunks.add(Uint8List(0)); // an empty file is still one (empty) chunk
+  }
   return chunks;
 }
 
 /// Accumulates chunks for one in-progress incoming file transfer.
 class IncomingFileTransfer {
-  IncomingFileTransfer({required this.name, required this.size, required this.chunkCount});
+  IncomingFileTransfer(
+      {required this.name, required this.size, required this.chunkCount}) {
+    validateFileMetadata(name, size, chunkCount);
+  }
 
   final String name;
   final int size;
   final int chunkCount;
   final Map<int, Uint8List> _chunks = {};
+  int receivedBytes = 0;
+  bool doneReceived = false;
+  bool saving = false;
+  bool cancelled = false;
+  bool receipts = false;
 
-  void addChunk(int index, Uint8List data) => _chunks[index] = data;
+  void addChunk(int index, Uint8List data) {
+    if (cancelled || saving || index < 0 || index >= chunkCount) {
+      throw const FormatException('Invalid chunk index or transfer state');
+    }
+    final expected =
+        index == chunkCount - 1 ? size - index * fileChunkSize : fileChunkSize;
+    if (data.length != expected) {
+      throw const FormatException('Invalid chunk length');
+    }
+    final previous = _chunks[index];
+    if (previous != null) {
+      for (var i = 0; i < data.length; i++) {
+        if (previous[i] != data[i]) {
+          throw const FormatException('Conflicting duplicate chunk');
+        }
+      }
+      return;
+    }
+    _chunks[index] = Uint8List.fromList(data);
+    receivedBytes += data.length;
+  }
 
-  bool get isComplete => _chunks.length >= chunkCount;
+  bool get isComplete =>
+      !cancelled && _chunks.length == chunkCount && receivedBytes == size;
 
-  double get progress => chunkCount == 0 ? 1.0 : _chunks.length / chunkCount;
+  double get progress =>
+      size == 0 ? (isComplete ? 1 : 0) : receivedBytes / size;
+
+  Iterable<Uint8List> get orderedChunks sync* {
+    if (!isComplete) throw StateError('File is incomplete');
+    for (var i = 0; i < chunkCount; i++) {
+      yield _chunks[i]!;
+    }
+  }
+
+  void clear() {
+    cancelled = true;
+    for (final chunk in _chunks.values) {
+      chunk.fillRange(0, chunk.length, 0);
+    }
+    _chunks.clear();
+    receivedBytes = 0;
+  }
 
   Uint8List assemble() {
     final builder = BytesBuilder(copy: false);
     for (var i = 0; i < chunkCount; i++) {
       final chunk = _chunks[i];
       if (chunk == null) {
-        throw StateError('assemble() called before all chunks arrived (missing chunk $i)');
+        throw StateError(
+            'assemble() called before all chunks arrived (missing chunk $i)');
       }
       builder.add(chunk);
     }

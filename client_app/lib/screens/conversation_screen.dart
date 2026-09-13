@@ -31,6 +31,9 @@ import '../bridge/native_crypto.dart';
 import '../models/contact.dart';
 import '../services/app_logger.dart';
 import '../services/file_transfer.dart';
+import '../services/file_sender.dart';
+import '../services/transfer_progress.dart';
+import '../widgets/transfer_status.dart';
 import '../services/relay_client.dart';
 import '../services/update_checker.dart';
 import '../theme/cypher_theme.dart';
@@ -81,26 +84,26 @@ class ChatMessage {
   bool get isFile => fileName != null;
 
   Map<String, dynamic> toJson() => {
-    'id': id,
-    'fromSelf': fromSelf,
-    'sentAt': sentAt.toIso8601String(),
-    if (text != null) 'text': text,
-    if (cipherHex != null) 'cipherHex': cipherHex,
-    if (fileName != null) 'fileName': fileName,
-    if (fileSize != null) 'fileSize': fileSize,
-    if (filePath != null) 'filePath': filePath,
-  };
+        'id': id,
+        'fromSelf': fromSelf,
+        'sentAt': sentAt.toIso8601String(),
+        if (text != null) 'text': text,
+        if (cipherHex != null) 'cipherHex': cipherHex,
+        if (fileName != null) 'fileName': fileName,
+        if (fileSize != null) 'fileSize': fileSize,
+        if (filePath != null) 'filePath': filePath,
+      };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
-    id: json['id'] as String? ?? '${json['sentAt']}-${json['fromSelf']}',
-    fromSelf: json['fromSelf'] as bool,
-    sentAt: DateTime.parse(json['sentAt'] as String),
-    text: json['text'] as String?,
-    cipherHex: json['cipherHex'] as String?,
-    fileName: json['fileName'] as String?,
-    fileSize: json['fileSize'] as int?,
-    filePath: json['filePath'] as String?,
-  );
+        id: json['id'] as String? ?? '${json['sentAt']}-${json['fromSelf']}',
+        fromSelf: json['fromSelf'] as bool,
+        sentAt: DateTime.parse(json['sentAt'] as String),
+        text: json['text'] as String?,
+        cipherHex: json['cipherHex'] as String?,
+        fileName: json['fileName'] as String?,
+        fileSize: json['fileSize'] as int?,
+        filePath: json['filePath'] as String?,
+      );
 }
 
 String _bytesToHex(Uint8List bytes) {
@@ -148,6 +151,29 @@ class _ConversationScreenState extends State<ConversationScreen> {
   final Set<String> _selfInitiated = {};
 
   final Map<String, IncomingFileTransfer> _incomingTransfers = {};
+  final Map<String, FileSender> _outgoingTransfers = {};
+  bool _startingUpload = false;
+  final Map<String, TransferProgress> _transferProgress = {};
+  final Map<String, Timer> _transferExpiry = {};
+  final Set<String> _processedPackets = {};
+  Future<void> _deliveryChain = Future<void>.value();
+  String _transferKey(Contact contact, String id) => '${contact.deviceId}:$id';
+
+  void _queueDelivery(RelayDelivery delivery) {
+    _deliveryChain = _deliveryChain.then((_) async {
+      if (!mounted || _isDisposing || _exitWipeDone) return;
+      try {
+        await _handleDelivery(delivery);
+      } catch (_) {
+        unawaited(AppLogger.warn('Incoming packet could not be processed'));
+        if (mounted && !_isDisposing) {
+          setState(() =>
+              _connectionStatus = 'INCOMING DATA REJECTED — RETRY TRANSFER');
+        }
+      }
+    });
+  }
+
   int _packetSeq = 0;
   final Map<String, List<ChatMessage>> _messagesByContact = {};
   final _composerController = TextEditingController();
@@ -184,7 +210,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
   // drop is handled by _sendDroppedFiles.
   bool _isDragHovering = false;
 
-  String _newMessageId() => '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
+  String _newMessageId() =>
+      '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
 
   @override
   void initState() {
@@ -218,8 +245,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
     // exactly the bug this comment is here to stop someone reintroducing.
     // Everything that touches the vault or a session must stay in this
     // function's synchronous prefix, not after any await.
-    unawaited(AppLogger.info('exit-wipe triggered (${_contacts.length} contact(s))'));
-    final hadAnySession = _contacts.any((c) => _sessions.containsKey(c.deviceId));
+    unawaited(
+        AppLogger.info('exit-wipe triggered (${_contacts.length} contact(s))'));
+    final hadAnySession =
+        _contacts.any((c) => _sessions.containsKey(c.deviceId));
     for (final contact in _contacts) {
       _wipeContactHistory(contact, notifyPeer: true);
     }
@@ -258,7 +287,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
   }
 
   void _saveContacts() {
-    widget.vault.put(utf8.encode(Contact.vaultKey), Contact.encodeList(_contacts));
+    widget.vault
+        .put(utf8.encode(Contact.vaultKey), Contact.encodeList(_contacts));
   }
 
   List<ChatMessage> _loadHistory(Contact contact) {
@@ -277,17 +307,38 @@ class _ConversationScreenState extends State<ConversationScreen> {
   void _persistHistory(Contact contact) {
     final messages = _messagesByContact[contact.deviceId] ?? [];
     final encoded = jsonEncode(messages.map((m) => m.toJson()).toList());
-    widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode(encoded));
+    final bytes = utf8.encode(encoded);
+    try {
+      if (!widget.vault
+          .put(utf8.encode('history:${contact.deviceId}'), bytes)) {
+        throw StateError('Could not save history');
+      }
+    } finally {
+      bytes.fillRange(0, bytes.length, 0);
+    }
   }
 
   Future<void> _connectToRelay() async {
     setState(() => _connectionStatus = 'CONNECTING...');
     try {
       final bundle = widget.identity.publicBundleBytes();
-      await _relayHttp.publishPreKeyBundle(_myDeviceId, bundle);
+      final published =
+          await _relayHttp.publishPreKeyBundle(_myDeviceId, bundle);
+      if (!mounted || _isDisposing) return;
+      if (!published) throw StateError('Relay rejected the public key bundle');
       final stream = RelayStream(baseUrl: _relayUrl, deviceId: _myDeviceId);
+      stream.deliveries.listen(_queueDelivery);
+      stream.connectionChanges.listen((connected) {
+        if (mounted && !_isDisposing && _relayStream == stream && !connected) {
+          setState(() => _connectionStatus = 'OFFLINE — CONNECTION LOST');
+        }
+      });
+      _relayStream = stream;
       await stream.connect();
-      stream.deliveries.listen(_handleDelivery);
+      if (!mounted || _isDisposing) {
+        await stream.close();
+        return;
+      }
       _relayStream = stream;
       if (!mounted) return;
       setState(() => _connectionStatus = 'ONLINE');
@@ -298,8 +349,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
     }
   }
 
-  void _handleDelivery(RelayDelivery delivery) {
+  Future<void> _handleDelivery(RelayDelivery delivery) async {
     if (delivery.payload.isEmpty) return;
+    final packetKey = '${delivery.sender}:${delivery.packetId}';
+    if (_processedPackets.contains(packetKey)) {
+      _relayStream?.ack(delivery.packetId);
+      return;
+    }
     final tag = delivery.payload[0];
     final body = delivery.payload.sublist(1);
 
@@ -318,14 +374,17 @@ class _ConversationScreenState extends State<ConversationScreen> {
         _relayStream?.ack(delivery.packetId);
         return;
       }
-      final session = NativeCrypto.instance.respondSession(widget.identity, body);
+      final session =
+          NativeCrypto.instance.respondSession(widget.identity, body);
       if (session == null) return;
       _selfInitiated.remove(peer);
+      _sessions.remove(delivery.sender)?.dispose();
       _sessions[delivery.sender] = session;
       if (!_contacts.any((c) => c.deviceId == delivery.sender)) {
         final newContact = Contact(
           deviceId: delivery.sender,
-          label: '0x${delivery.sender.substring(0, 8).toUpperCase()}',
+          label:
+              '0x${delivery.sender.substring(0, delivery.sender.length.clamp(0, 8)).toUpperCase()}',
         );
         setState(() {
           _contacts = [..._contacts, newContact];
@@ -337,7 +396,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
     } else if (tag == relayTagMessage) {
       final session = _sessions[delivery.sender];
       if (session == null) {
-        AppLogger.warn('dropped message from ${delivery.sender}: no active session');
+        AppLogger.warn(
+            'dropped message from ${delivery.sender}: no active session');
         return;
       }
       final plaintext = session.decrypt(Uint8List.fromList(body));
@@ -347,20 +407,33 @@ class _ConversationScreenState extends State<ConversationScreen> {
       }
       final contact = _contacts.firstWhere(
         (c) => c.deviceId == delivery.sender,
-        orElse: () => Contact(deviceId: delivery.sender, label: delivery.sender),
+        orElse: () =>
+            Contact(deviceId: delivery.sender, label: delivery.sender),
       );
-      _handleEnvelope(contact, MessageEnvelope.decode(plaintext), Uint8List.fromList(body));
+      MessageEnvelope? envelope;
+      try {
+        envelope = MessageEnvelope.decode(plaintext);
+        await _handleEnvelope(contact, envelope, Uint8List.fromList(body));
+      } finally {
+        plaintext.fillRange(0, plaintext.length, 0);
+        if (envelope is FileChunkEnvelope) {
+          envelope.data.fillRange(0, envelope.data.length, 0);
+        }
+      }
+    }
+    _processedPackets.add(packetKey);
+    if (_processedPackets.length > 2048) {
+      _processedPackets.remove(_processedPackets.first);
     }
     _relayStream?.ack(delivery.packetId);
   }
 
-  void _handleEnvelope(Contact contact, MessageEnvelope envelope, Uint8List ciphertext) {
+  Future<void> _handleEnvelope(
+      Contact contact, MessageEnvelope envelope, Uint8List ciphertext) async {
     switch (envelope) {
       case TextEnvelope(:final body):
         setState(() {
-          _messagesByContact
-              .putIfAbsent(contact.deviceId, () => [])
-              .add(
+          _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
                 ChatMessage(
                   id: _newMessageId(),
                   fromSelf: false,
@@ -372,18 +445,68 @@ class _ConversationScreenState extends State<ConversationScreen> {
         });
         _persistHistory(contact);
 
-      case FileOfferEnvelope(:final id, :final name, :final size, :final chunkCount):
-        _incomingTransfers[id] = IncomingFileTransfer(
-          name: name,
-          size: size,
-          chunkCount: chunkCount,
-        );
+      case FileOfferEnvelope(
+          :final id,
+          :final name,
+          :final size,
+          :final chunkCount,
+          :final receipts
+        ):
+        final key = _transferKey(contact, id);
+        if (id.isEmpty ||
+            id.length > 128 ||
+            _incomingTransfers.containsKey(key)) {
+          throw const FormatException('Invalid or repeated file offer');
+        }
+        try {
+          if (_incomingTransfers.length >= 2) {
+            throw const FormatException('Too many incoming files');
+          }
+          final transfer = IncomingFileTransfer(
+              name: name, size: size, chunkCount: chunkCount)
+            ..receipts = receipts;
+          _incomingTransfers[key] = transfer;
+          final progress =
+              TransferProgress(name: name, totalBytes: size, uploading: false)
+                ..phase = TransferPhase.transferring;
+          _showTransfer(key, progress);
+          _armTransferExpiry(contact, id);
+          _sendFileReceipt(contact, id, transfer, 'ready');
+        } catch (_) {
+          if (receipts) {
+            _sendReceipt(contact,
+                FileReceiptEnvelope(id: id, bytes: 0, stage: 'failed'));
+          }
+          rethrow;
+        }
 
       case FileChunkEnvelope(:final id, :final index, :final data):
-        _incomingTransfers[id]?.addChunk(index, data);
+        final key = _transferKey(contact, id);
+        final transfer = _incomingTransfers[key];
+        if (transfer == null) {
+          throw const FormatException('File offer missing or expired');
+        }
+        try {
+          transfer.addChunk(index, data);
+          _transferProgress[key]?.updateBytes(transfer.receivedBytes);
+          _armTransferExpiry(contact, id);
+          _sendFileReceipt(contact, id, transfer, 'received');
+          if (transfer.doneReceived && transfer.isComplete) {
+            await _finishIncomingFile(contact, id);
+          }
+        } catch (_) {
+          _cancelIncoming(contact, id, failed: true);
+          rethrow;
+        }
 
       case FileDoneEnvelope(:final id):
-        _finishIncomingFile(contact, id);
+        final transfer = _incomingTransfers[_transferKey(contact, id)];
+        if (transfer == null) return;
+        transfer.doneReceived = true;
+        if (transfer.isComplete) await _finishIncomingFile(contact, id);
+
+      case FileReceiptEnvelope(:final id):
+        _outgoingTransfers[_transferKey(contact, id)]?.acceptReceipt(envelope);
 
       case WipeEnvelope():
         _wipeContactHistory(contact, notifyPeer: false);
@@ -396,11 +519,29 @@ class _ConversationScreenState extends State<ConversationScreen> {
   /// one explicitly closing (see `dispose`). Contacts and sessions
   /// themselves are left intact; only the message log is destroyed.
   void _wipeContactHistory(Contact contact, {required bool notifyPeer}) {
-    final session = _sessions[contact.deviceId];
-    if (notifyPeer && session != null) {
-      _sendEnvelope(contact, session, WipeEnvelope());
+    final prefix = '${contact.deviceId}:';
+    for (final key in _incomingTransfers.keys
+        .where((k) => k.startsWith(prefix))
+        .toList()) {
+      _cancelIncoming(contact, key.substring(prefix.length));
     }
-    for (final message in _messagesByContact[contact.deviceId] ?? const <ChatMessage>[]) {
+    for (final entry in _outgoingTransfers.entries
+        .where((e) => e.key.startsWith(prefix))
+        .toList()) {
+      entry.value.cancel();
+    }
+    _transferProgress.removeWhere((key, _) => key.startsWith(prefix));
+    final session = _sessions[contact.deviceId];
+    if (notifyPeer && session != null && _isRelayConnected) {
+      try {
+        _sendEnvelope(contact, session, WipeEnvelope());
+      } catch (_) {
+        // A disconnected peer must not prevent the local wipe.
+        AppLogger.warn('peer wipe notification could not be sent');
+      }
+    }
+    for (final message
+        in _messagesByContact[contact.deviceId] ?? const <ChatMessage>[]) {
       _revealTimers.remove(message.id)?.cancel();
       _revealedMessageIds.remove(message.id);
       // Clearing the message list alone leaves any received file sitting
@@ -416,32 +557,126 @@ class _ConversationScreenState extends State<ConversationScreen> {
     } else {
       _messagesByContact[contact.deviceId] = [];
     }
-    widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode('[]'));
+    widget.vault
+        .put(utf8.encode('history:${contact.deviceId}'), utf8.encode('[]'));
   }
 
   Future<void> _finishIncomingFile(Contact contact, String transferId) async {
-    final transfer = _incomingTransfers.remove(transferId);
-    if (transfer == null || !transfer.isComplete) return;
-    final bytes = transfer.assemble();
-    final downloadsDir = await getApplicationSupportDirectory();
-    final receivedDir = Directory('${downloadsDir.path}/received_files');
-    await receivedDir.create(recursive: true);
-    final savedPath = '${receivedDir.path}/${transfer.name}';
-    await File(savedPath).writeAsBytes(bytes);
-    if (!mounted) return;
-    setState(() {
-      _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
-        ChatMessage(
-          id: _newMessageId(),
-          fromSelf: false,
-          sentAt: DateTime.now(),
-          fileName: transfer.name,
-          fileSize: transfer.size,
-          filePath: savedPath,
-        ),
-      );
-    });
-    _persistHistory(contact);
+    final key = _transferKey(contact, transferId);
+    final transfer = _incomingTransfers[key];
+    if (transfer == null || !transfer.isComplete || transfer.saving) return;
+    transfer.saving = true;
+    _transferExpiry.remove(key)?.cancel();
+    _transferProgress[key]?.phase = TransferPhase.saving;
+    Directory? uniqueDir;
+    String? savedPath;
+    RandomAccessFile? output;
+    try {
+      final downloadsDir = await getApplicationSupportDirectory();
+      final receivedDir = Directory('${downloadsDir.path}/received_files');
+      await receivedDir.create(recursive: true);
+      // Each transfer owns a generated directory; repeated names cannot
+      // overwrite other files. The peer never controls any directory segment.
+      uniqueDir = await receivedDir.createTemp('transfer-');
+      savedPath = '${uniqueDir.path}/${transfer.name}';
+      if (!mounted || transfer.cancelled || _exitWipeDone) return;
+      output = await File(savedPath).open(mode: FileMode.write);
+      for (final chunk in transfer.orderedChunks) {
+        if (!mounted || transfer.cancelled || _exitWipeDone) return;
+        await output.writeFrom(chunk);
+      }
+      await output.flush();
+      await output.close();
+      output = null;
+      if (!mounted || transfer.cancelled || _exitWipeDone) return;
+      setState(() {
+        _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
+              ChatMessage(
+                id: _newMessageId(),
+                fromSelf: false,
+                sentAt: DateTime.now(),
+                fileName: transfer.name,
+                fileSize: transfer.size,
+                filePath: savedPath!,
+              ),
+            );
+      });
+      _persistHistory(contact);
+      _sendFileReceipt(contact, transferId, transfer, 'saved');
+      _transferProgress[key]?.phase = TransferPhase.complete;
+      uniqueDir = null; // Retain only a fully saved, tracked attachment.
+    } catch (_) {
+      _transferProgress[key]?.phase = TransferPhase.failed;
+      _sendFileReceipt(contact, transferId, transfer, 'failed');
+      _messagesByContact[contact.deviceId]
+          ?.removeWhere((message) => message.filePath == savedPath);
+    } finally {
+      try {
+        await output?.close();
+      } catch (_) {/* Continue cleanup after an I/O failure. */}
+      if (uniqueDir != null) {
+        try {
+          await uniqueDir.delete(recursive: true);
+        } catch (_) {/* Best effort cleanup of this transfer only. */}
+      }
+      _incomingTransfers.remove(key);
+      transfer.clear();
+    }
+  }
+
+  void _showTransfer(String key, TransferProgress progress) {
+    // Keep a small list of recent results; do not retain every progress object.
+    final inactive =
+        _transferProgress.entries.where((e) => !e.value.active).toList();
+    for (final entry
+        in inactive.take((inactive.length - 3).clamp(0, inactive.length))) {
+      _transferProgress.remove(entry.key);
+      _outgoingTransfers.remove(entry.key);
+    }
+    setState(() => _transferProgress[key] = progress);
+  }
+
+  void _sendReceipt(Contact contact, FileReceiptEnvelope receipt) {
+    final session = _sessions[contact.deviceId];
+    if (session == null || !_isRelayConnected || _isDisposing) return;
+    try {
+      _sendEnvelope(contact, session, receipt);
+    } catch (_) {/* Sender times out honestly. */}
+  }
+
+  void _sendFileReceipt(
+      Contact contact, String id, IncomingFileTransfer transfer, String stage) {
+    if (transfer.receipts) {
+      _sendReceipt(
+          contact,
+          FileReceiptEnvelope(
+              id: id, bytes: transfer.receivedBytes, stage: stage));
+    }
+  }
+
+  void _armTransferExpiry(Contact contact, String id) {
+    final key = _transferKey(contact, id);
+    _transferExpiry.remove(key)?.cancel();
+    _transferExpiry[key] = Timer(const Duration(minutes: 2),
+        () => _cancelIncoming(contact, id, failed: true));
+  }
+
+  void _cancelIncoming(Contact contact, String id, {bool failed = false}) {
+    final key = _transferKey(contact, id);
+    _transferExpiry.remove(key)?.cancel();
+    final transfer = _incomingTransfers.remove(key);
+    if (transfer != null) {
+      _sendFileReceipt(contact, id, transfer, 'failed');
+      // An asynchronous disk write may still own this buffer. Its finally
+      // block clears it after the write closes; cancellation prevents publish.
+      if (transfer.saving) {
+        transfer.cancelled = true;
+      } else {
+        transfer.clear();
+      }
+    }
+    _transferProgress[key]?.phase =
+        failed ? TransferPhase.failed : TransferPhase.cancelled;
   }
 
   Future<void> _openAddContact() async {
@@ -482,28 +717,32 @@ class _ConversationScreenState extends State<ConversationScreen> {
         backgroundColor: VaultXColors.backgroundPanel,
         title: const Text(
           'REMOVE CONTACT?',
-          style: TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
+          style: TextStyle(
+              color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
         ),
         content: Text(
           'This deletes your local session and message history with '
           '"${contact.label}". They will need to be re-added to chat again.',
-          style: const TextStyle(color: VaultXColors.phosphorDim, fontFamily: VaultXFonts.mono),
+          style: const TextStyle(
+              color: VaultXColors.phosphorDim, fontFamily: VaultXFonts.mono),
         ),
         actions: [
-          AsciiButton(label: 'Cancel', onPressed: () => Navigator.of(context).pop(false)),
-          AsciiButton(label: 'Remove', onPressed: () => Navigator.of(context).pop(true)),
+          AsciiButton(
+              label: 'Cancel',
+              onPressed: () => Navigator.of(context).pop(false)),
+          AsciiButton(
+              label: 'Remove',
+              onPressed: () => Navigator.of(context).pop(true)),
         ],
       ),
     );
     if (confirmed != true) return;
+    _wipeContactHistory(contact, notifyPeer: false);
     _sessions.remove(contact.deviceId)?.dispose();
     _selfInitiated.remove(contact.deviceId);
-    // No delete op is exposed over the FFI bridge (put/get only) — an
-    // empty history blob reads back the same as "no history" via
-    // _loadHistory's empty-list decode.
-    widget.vault.put(utf8.encode('history:${contact.deviceId}'), utf8.encode('[]'));
     setState(() {
-      _contacts = _contacts.where((c) => c.deviceId != contact.deviceId).toList();
+      _contacts =
+          _contacts.where((c) => c.deviceId != contact.deviceId).toList();
       _messagesByContact.remove(contact.deviceId);
       if (_selectedContact?.deviceId == contact.deviceId) {
         _selectedContact = _contacts.isNotEmpty ? _contacts.first : null;
@@ -513,15 +752,21 @@ class _ConversationScreenState extends State<ConversationScreen> {
   }
 
   /// True only when the WebSocket to the relay is actually open. Both
-  /// message and file sends must check this *before* queuing anything —
-  /// `RelayStream.send` silently no-ops on a closed channel (see its own
-  /// doc), so without this check a send while offline (or one that drops
-  /// mid-transfer) looks identical, in the UI, to a successful one: no
-  /// error, message marked sent, but the peer never receives it.
+  /// message and file sends check this before encrypting/queuing anything.
+  /// RelayStream also rejects writes after a disconnect.
   bool get _isRelayConnected => _relayStream?.isConnected ?? false;
 
-  Uint8List _sendEnvelope(Contact contact, NativeSession session, MessageEnvelope envelope) {
-    final ciphertext = session.encrypt(envelope.encode());
+  Uint8List _sendEnvelope(
+      Contact contact, NativeSession session, MessageEnvelope envelope) {
+    if (!_isRelayConnected) throw StateError('Relay disconnected');
+    final plaintext = envelope.encode();
+    late Uint8List ciphertext;
+    try {
+      ciphertext = session.encrypt(plaintext);
+    } finally {
+      plaintext.fillRange(0, plaintext.length, 0);
+    }
+    if (ciphertext.isEmpty) throw StateError('Encryption failed');
     final packetId = _newMessageId();
     _relayStream?.send(
       contact.deviceId,
@@ -541,15 +786,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
       return;
     }
     if (!_isRelayConnected) {
-      setState(() => _connectionStatus = 'OFFLINE — MESSAGE NOT SENT, RECONNECTING...');
+      setState(() => _connectionStatus = 'OFFLINE — MESSAGE NOT SENT');
       AppLogger.warn('dropped outgoing text: relay not connected');
       return;
     }
-    final ciphertext = _sendEnvelope(contact, session, TextEnvelope(text));
+    late Uint8List ciphertext;
+    try {
+      ciphertext = _sendEnvelope(contact, session, TextEnvelope(text));
+    } catch (_) {
+      setState(() => _connectionStatus = 'MESSAGE NOT SENT — CHECK CONNECTION');
+      return;
+    }
     setState(() {
-      _messagesByContact
-          .putIfAbsent(contact.deviceId, () => [])
-          .add(
+      _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
             ChatMessage(
               id: _newMessageId(),
               fromSelf: true,
@@ -560,125 +809,115 @@ class _ConversationScreenState extends State<ConversationScreen> {
           );
       _composerController.clear();
     });
-    _persistHistory(contact);
-  }
-
-  /// Sends a file of any size to the selected contact: an offer envelope
-  /// (name/size/chunk count) followed by as many chunk envelopes as needed
-  /// (see file_transfer.dart), each individually ratchet-encrypted and
-  /// relayed as its own packet — there's no per-file size ceiling, only a
-  /// per-chunk one, since the relay never sees more than one chunk at a
-  /// time and never reassembles anything itself.
-  Future<void> _sendFile() async {
-    if (_selectedContact == null) return;
-
-    FilePickerResult? result;
     try {
-      result = await FilePicker.pickFiles(withData: true);
-    } catch (e) {
-      await AppLogger.error('file picker failed', e);
-      if (!mounted) return;
-      setState(() => _connectionStatus = 'FILE PICKER FAILED — SEE LOG');
-      return;
-    }
-    if (result == null || result.files.isEmpty) return;
-    final picked = result.files.first;
-    if (picked.bytes == null) {
-      await AppLogger.warn('picked file "${picked.name}" had no data (withData read failed)');
-      if (!mounted) return;
-      setState(() => _connectionStatus = 'COULD NOT READ THAT FILE — TRY AGAIN');
-      return;
-    }
-    await _sendFileBytes(picked.name, picked.bytes!);
-  }
-
-  /// Sends files dropped onto the conversation via drag-and-drop —
-  /// dropping onto any part of this screen sends to whichever contact is
-  /// currently selected, same as tapping "Attach". Reads each file fully
-  /// into memory up front (matches FilePicker's `withData: true` above),
-  /// which is fine at chat-attachment scale but would need streaming for
-  /// arbitrarily huge drops.
-  Future<void> _sendDroppedFiles(List<XFile> files) async {
-    if (_selectedContact == null) return;
-    for (final file in files) {
-      Uint8List bytes;
-      try {
-        bytes = await file.readAsBytes();
-      } catch (e) {
-        await AppLogger.error('failed to read dropped file "${file.name}"', e);
-        if (!mounted) return;
-        setState(() => _connectionStatus = 'COULD NOT READ DROPPED FILE — TRY AGAIN');
-        continue;
-      }
-      await _sendFileBytes(file.name, bytes);
+      _persistHistory(contact);
+    } catch (_) {
+      setState(() => _connectionStatus =
+          'MESSAGE QUEUED — LOCAL HISTORY COULD NOT BE SAVED');
     }
   }
 
-  /// Shared send path for both the file picker and drag-and-drop: splits,
-  /// encrypts, and relays [bytes] as [name] to the currently selected
-  /// contact.
-  Future<void> _sendFileBytes(String name, Uint8List bytes) async {
+  Future<void> _sendFile() async {
     final contact = _selectedContact;
     if (contact == null) return;
+    try {
+      final result = await FilePicker.pickFiles(withData: false);
+      if (result == null || result.files.isEmpty || !mounted) return;
+      final picked = result.files.first;
+      if (picked.path == null) throw StateError('File path unavailable');
+      await _sendFilePath(contact, picked.name, File(picked.path!));
+    } catch (_) {
+      if (mounted) {
+        setState(() => _connectionStatus = 'COULD NOT OPEN FILE — TRY AGAIN');
+      }
+    }
+  }
+
+  Future<void> _sendDroppedFiles(List<XFile> files) async {
+    // Capture the recipient before the first asynchronous file operation.
+    final contact = _selectedContact;
+    if (contact == null) return;
+    for (final file in files) {
+      if (!mounted || _exitWipeDone) return;
+      await _sendFilePath(contact, file.name, File(file.path));
+    }
+  }
+
+  Future<void> _sendFilePath(Contact contact, String name, File file) async {
     final session = _sessions[contact.deviceId];
-    if (session == null) {
-      setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
+    if (session == null || !_isRelayConnected) {
+      if (mounted) {
+        setState(() =>
+            _connectionStatus = 'CONTACT OR RELAY OFFLINE — FILE NOT SENT');
+      }
       return;
     }
-    if (!_isRelayConnected) {
-      setState(() => _connectionStatus = 'OFFLINE — CANNOT SEND FILE, RECONNECTING...');
-      await AppLogger.warn('dropped outgoing file: relay not connected');
+    if (_startingUpload ||
+        _outgoingTransfers.values.any((s) => s.progress.active)) {
+      setState(() => _connectionStatus = 'PLEASE WAIT FOR THE CURRENT UPLOAD');
       return;
     }
-
-    final chunks = splitIntoChunks(bytes);
-    final transferId = '${DateTime.now().microsecondsSinceEpoch}-${_packetSeq++}';
-
-    setState(() => _connectionStatus = 'SENDING $name...');
-    _sendEnvelope(
-      contact,
-      session,
-      FileOfferEnvelope(
-        id: transferId,
-        name: name,
-        size: bytes.length,
-        chunkCount: chunks.length,
-      ),
-    );
-    for (var i = 0; i < chunks.length; i++) {
-      // Checked every chunk, not just once up front: a large file takes
-      // real time to send across many packets, and the connection can
-      // drop partway through — abort and say so clearly rather than
-      // silently "finishing" a transfer the peer only received part of.
-      if (!_isRelayConnected) {
-        await AppLogger.warn(
-          'relay disconnected mid-file-send: $name (chunk $i/${chunks.length})',
-        );
-        if (!mounted) return;
-        setState(() => _connectionStatus = 'OFFLINE — FILE SEND INTERRUPTED');
+    _startingUpload = true;
+    try {
+      final size = await file.length();
+      validateFileMetadata(name, size,
+          size == 0 ? 1 : (size + fileChunkSize - 1) ~/ fileChunkSize);
+      if (!mounted || _exitWipeDone) return;
+      final id = _newMessageId();
+      final key = _transferKey(contact, id);
+      final sender = FileSender(
+          id: id,
+          file: file,
+          name: name,
+          size: size,
+          send: (envelope) {
+            if (!mounted ||
+                _exitWipeDone ||
+                _sessions[contact.deviceId] != session) {
+              throw StateError('Session ended');
+            }
+            _sendEnvelope(contact, session, envelope);
+          });
+      _outgoingTransfers[key] = sender;
+      _showTransfer(key, sender.progress);
+      await sender.run();
+      if (!mounted ||
+          _exitWipeDone ||
+          sender.progress.phase == TransferPhase.cancelled) {
         return;
       }
-      _sendEnvelope(
-        contact,
-        session,
-        FileChunkEnvelope(id: transferId, index: i, data: chunks[i]),
-      );
+      if (![TransferPhase.complete, TransferPhase.unconfirmed]
+          .contains(sender.progress.phase)) {
+        return;
+      }
+      setState(() {
+        _messagesByContact
+            .putIfAbsent(contact.deviceId, () => [])
+            .add(ChatMessage(
+              id: _newMessageId(),
+              fromSelf: true,
+              sentAt: DateTime.now(),
+              fileName: name,
+              fileSize: size,
+              text: sender.progress.phase == TransferPhase.complete
+                  ? 'Delivered'
+                  : 'Delivery unconfirmed',
+            ));
+      });
+      _persistHistory(contact);
+    } on FormatException {
+      if (mounted) {
+        setState(() =>
+            _connectionStatus = 'FILE NOT SENT — LIMIT 64 MiB; CHECK FILENAME');
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() =>
+            _connectionStatus = 'FILE SEND FAILED — CHECK FILE AND CONNECTION');
+      }
+    } finally {
+      _startingUpload = false;
     }
-    _sendEnvelope(contact, session, FileDoneEnvelope(transferId));
-    if (!mounted) return;
-    setState(() {
-      _connectionStatus = 'ONLINE';
-      _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
-        ChatMessage(
-          id: _newMessageId(),
-          fromSelf: true,
-          sentAt: DateTime.now(),
-          fileName: name,
-          fileSize: bytes.length,
-        ),
-      );
-    });
-    _persistHistory(contact);
   }
 
   /// Toggles a message between its default ciphertext-hex view and
@@ -730,11 +969,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
         backgroundColor: VaultXColors.backgroundPanel,
         title: const Text(
           'RELAY ADDRESS',
-          style: TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
+          style: TextStyle(
+              color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
         ),
         content: TerminalTextField(controller: controller),
         actions: [
-          AsciiButton(label: 'Cancel', onPressed: () => Navigator.of(context).pop()),
+          AsciiButton(
+              label: 'Cancel', onPressed: () => Navigator.of(context).pop()),
           AsciiButton(
             label: 'Save',
             onPressed: () => Navigator.of(context).pop(controller.text.trim()),
@@ -762,17 +1003,20 @@ class _ConversationScreenState extends State<ConversationScreen> {
           backgroundColor: VaultXColors.backgroundPanel,
           title: const Text(
             'UPDATE MANIFEST URL NOT SET',
-            style: TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
+            style: TextStyle(
+                color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
           ),
           content: TerminalTextField(
             controller: controller,
             hintText: 'https://.../update-manifest.json',
           ),
           actions: [
-            AsciiButton(label: 'Cancel', onPressed: () => Navigator.of(context).pop()),
+            AsciiButton(
+                label: 'Cancel', onPressed: () => Navigator.of(context).pop()),
             AsciiButton(
               label: 'Save',
-              onPressed: () => Navigator.of(context).pop(controller.text.trim()),
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
             ),
           ],
         ),
@@ -795,12 +1039,14 @@ class _ConversationScreenState extends State<ConversationScreen> {
       // it isn't covered by that inner timeout — this outer one is a hard
       // backstop so the "Checking for updates..." snackbar can never hang
       // indefinitely no matter what fails underneath.
-      update = await UpdateChecker.checkForUpdate(manifestUrl).timeout(const Duration(seconds: 15));
+      update = await UpdateChecker.checkForUpdate(manifestUrl)
+          .timeout(const Duration(seconds: 15));
     } on TimeoutException {
       await AppLogger.warn('update check timed out ($manifestUrl)');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Update check timed out — try again later.')),
+        const SnackBar(
+            content: Text('Update check timed out — try again later.')),
       );
       return;
     }
@@ -823,14 +1069,18 @@ class _ConversationScreenState extends State<ConversationScreen> {
         backgroundColor: VaultXColors.backgroundPanel,
         title: Text(
           'UPDATE AVAILABLE: v${resolvedUpdate.version}',
-          style: const TextStyle(color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
+          style: const TextStyle(
+              color: VaultXColors.phosphor, fontFamily: VaultXFonts.mono),
         ),
         content: Text(
           resolvedUpdate.notes ?? 'A newer version of Vault X is available.',
-          style: const TextStyle(color: VaultXColors.phosphorDim, fontFamily: VaultXFonts.mono),
+          style: const TextStyle(
+              color: VaultXColors.phosphorDim, fontFamily: VaultXFonts.mono),
         ),
         actions: [
-          AsciiButton(label: 'Later', onPressed: () => Navigator.of(context).pop(false)),
+          AsciiButton(
+              label: 'Later',
+              onPressed: () => Navigator.of(context).pop(false)),
           AsciiButton(
             label: canAutoInstall ? 'Update Now' : 'Open Download Page',
             onPressed: () => Navigator.of(context).pop(true),
@@ -853,7 +1103,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
       const SnackBar(content: Text('Downloading update...')),
     );
     try {
-      await UpdateChecker.downloadAndLaunchInstaller(resolvedUpdate.installerUrl);
+      await UpdateChecker.downloadAndLaunchInstaller(
+          resolvedUpdate.installerUrl);
       // The installer needs this process's files unlocked to overwrite
       // them; closing now (rather than leaving the user to close it
       // manually) is what makes this a true one-click update.
@@ -878,6 +1129,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
     // skipping it would leave history sitting un-burned.
     unawaited(_wipeAllOnExit());
     _lifecycleListener?.dispose();
+    for (final timer in _transferExpiry.values) {
+      timer.cancel();
+    }
     for (final timer in _revealTimers.values) {
       timer.cancel();
     }
@@ -968,9 +1222,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
                             for (final contact in _contacts)
                               _ContactListTile(
                                 contact: contact,
-                                selected: contact.deviceId == _selectedContact?.deviceId,
+                                selected: contact.deviceId ==
+                                    _selectedContact?.deviceId,
                                 online: _sessions.containsKey(contact.deviceId),
-                                onTap: () => setState(() => _selectedContact = contact),
+                                onTap: () =>
+                                    setState(() => _selectedContact = contact),
                                 onRemove: () => _removeContact(contact),
                               ),
                           ],
@@ -978,7 +1234,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
                       ),
                     Padding(
                       padding: const EdgeInsets.all(10),
-                      child: AsciiButton(label: '+ Add Contact', onPressed: _openAddContact),
+                      child: AsciiButton(
+                          label: '+ Add Contact', onPressed: _openAddContact),
                     ),
                   ],
                 ),
@@ -1004,7 +1261,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
                       child: Column(
                         children: [
                           Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 10),
                             // Wrap rather than Row: two badges plus three
                             // buttons need ~1150px to fit on one line, wider
                             // than this panel gets once the window is
@@ -1018,36 +1276,79 @@ class _ConversationScreenState extends State<ConversationScreen> {
                               runSpacing: 8,
                               crossAxisAlignment: WrapCrossAlignment.center,
                               children: [
-                                const CipherBadge(label: 'ENC: CHACHA20-POLY1305'),
-                                const CipherBadge(label: 'POST-QUANTUM: ENABLED'),
-                                AsciiButton(label: 'My ID', onPressed: _copyMyId),
-                                AsciiButton(label: 'Updates', onPressed: _checkForUpdates),
-                                AsciiButton(label: 'View Log', onPressed: _openLog),
+                                const CipherBadge(
+                                    label: 'ENC: CHACHA20-POLY1305'),
+                                const CipherBadge(
+                                    label: 'POST-QUANTUM: ENABLED'),
+                                AsciiButton(
+                                    label: 'My ID', onPressed: _copyMyId),
+                                AsciiButton(
+                                    label: 'Updates',
+                                    onPressed: _checkForUpdates),
+                                AsciiButton(
+                                    label: 'View Log', onPressed: _openLog),
                               ],
                             ),
                           ),
                           const Divider(height: 1, color: VaultXColors.border),
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxHeight: 220),
+                            child: SingleChildScrollView(
+                                child: Column(children: [
+                              for (final entry in _transferProgress.entries
+                                  .where((e) =>
+                                      _selectedContact != null &&
+                                      e.key.startsWith(
+                                          '${_selectedContact!.deviceId}:')))
+                                TransferStatus(
+                                    key: ValueKey(entry.key),
+                                    progress: entry.value,
+                                    onCancel: !entry.value.active
+                                        ? null
+                                        : () {
+                                            final outgoing =
+                                                _outgoingTransfers[entry.key];
+                                            if (outgoing != null) {
+                                              outgoing.cancel();
+                                            } else {
+                                              final contact = _selectedContact!;
+                                              _cancelIncoming(
+                                                  contact,
+                                                  entry.key.substring(
+                                                      contact.deviceId.length +
+                                                          1));
+                                            }
+                                          }),
+                            ])),
+                          ),
                           Expanded(
                             child: _selectedContact == null
-                                ? _NoContactSelectedHint(onStartChat: _openAddContact)
-                                : ListView(
+                                ? _NoContactSelectedHint(
+                                    onStartChat: _openAddContact)
+                                : ListView.builder(
                                     padding: const EdgeInsets.all(14),
-                                    children: [
-                                      for (final message
-                                          in _messagesByContact[_selectedContact!.deviceId] ??
-                                              [])
-                                        _MessageLine(
-                                          message: message,
-                                          revealed: _revealedMessageIds.contains(message.id),
-                                          onToggleReveal: () => _toggleReveal(message.id),
-                                        ),
-                                    ],
+                                    itemCount: (_messagesByContact[
+                                                _selectedContact!.deviceId] ??
+                                            [])
+                                        .length,
+                                    itemBuilder: (context, index) {
+                                      final message = _messagesByContact[
+                                          _selectedContact!.deviceId]![index];
+                                      return _MessageLine(
+                                        message: message,
+                                        revealed: _revealedMessageIds
+                                            .contains(message.id),
+                                        onToggleReveal: () =>
+                                            _toggleReveal(message.id),
+                                      );
+                                    },
                                   ),
                           ),
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: const BoxDecoration(
-                              border: Border(top: BorderSide(color: VaultXColors.border)),
+                              border: Border(
+                                  top: BorderSide(color: VaultXColors.border)),
                             ),
                             child: Row(
                               children: [
@@ -1063,12 +1364,16 @@ class _ConversationScreenState extends State<ConversationScreen> {
                                 const SizedBox(width: 8),
                                 AsciiButton(
                                   label: 'Attach',
-                                  onPressed: _selectedContact == null ? null : _sendFile,
+                                  onPressed: _selectedContact == null
+                                      ? null
+                                      : _sendFile,
                                 ),
                                 const SizedBox(width: 8),
                                 AsciiButton(
                                   label: 'Send',
-                                  onPressed: _selectedContact == null ? null : _sendMessage,
+                                  onPressed: _selectedContact == null
+                                      ? null
+                                      : _sendMessage,
                                 ),
                               ],
                             ),
@@ -1085,8 +1390,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
                         child: IgnorePointer(
                           child: DecoratedBox(
                             decoration: BoxDecoration(
-                              color: VaultXColors.phosphor.withValues(alpha: 0.08),
-                              border: Border.all(color: VaultXColors.phosphor, width: 2),
+                              color:
+                                  VaultXColors.phosphor.withValues(alpha: 0.08),
+                              border: Border.all(
+                                  color: VaultXColors.phosphor, width: 2),
                             ),
                             child: const Center(
                               child: Text(
@@ -1176,14 +1483,17 @@ class _ContactListTile extends StatelessWidget {
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        color: selected ? VaultXColors.phosphorDim.withValues(alpha: 0.15) : null,
+        color:
+            selected ? VaultXColors.phosphorDim.withValues(alpha: 0.15) : null,
         child: Row(
           children: [
             Expanded(
               child: Text(
                 contact.label,
                 style: TextStyle(
-                  color: selected ? VaultXColors.phosphor : VaultXColors.phosphorDim,
+                  color: selected
+                      ? VaultXColors.phosphor
+                      : VaultXColors.phosphorDim,
                   fontFamily: VaultXFonts.mono,
                   fontSize: 13,
                 ),
@@ -1241,38 +1551,42 @@ class _MessageLine extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final prefix = message.fromSelf ? 'you' : 'peer';
-    final color = message.fromSelf ? VaultXColors.phosphor : VaultXColors.phosphorDim;
+    final color =
+        message.fromSelf ? VaultXColors.phosphor : VaultXColors.phosphorDim;
     final time = message.sentAt.toIso8601String().substring(11, 19);
 
     final bodySpan = message.isFile
         ? TextSpan(
             text:
                 '📎 ${message.fileName} (${_formatSize(message.fileSize ?? 0)})'
-                '${message.filePath != null ? ' — click to reveal' : ''}',
+                '${message.filePath != null ? ' — click to reveal' : ''}'
+                '${message.fromSelf ? ' — ${message.text ?? 'Delivery unconfirmed'}' : ''}',
             style: TextStyle(
               color: VaultXColors.phosphor,
-              decoration: message.filePath != null ? TextDecoration.underline : null,
+              decoration:
+                  message.filePath != null ? TextDecoration.underline : null,
             ),
             recognizer: message.filePath != null
                 ? (TapGestureRecognizer()..onTap = _openFile)
                 : null,
           )
         : (revealed || message.cipherHex == null)
-              ? TextSpan(
-                  text: '${message.text}${message.cipherHex != null ? '  [tap to hide]' : ''}',
-                  style: const TextStyle(color: VaultXColors.phosphor),
-                  recognizer: message.cipherHex != null
-                      ? (TapGestureRecognizer()..onTap = onToggleReveal)
-                      : null,
-                )
-              : TextSpan(
-                  text: '🔒 ${message.cipherHex}',
-                  style: const TextStyle(
-                    color: VaultXColors.phosphorDim,
-                    fontStyle: FontStyle.italic,
-                  ),
-                  recognizer: TapGestureRecognizer()..onTap = onToggleReveal,
-                );
+            ? TextSpan(
+                text:
+                    '${message.text}${message.cipherHex != null ? '  [tap to hide]' : ''}',
+                style: const TextStyle(color: VaultXColors.phosphor),
+                recognizer: message.cipherHex != null
+                    ? (TapGestureRecognizer()..onTap = onToggleReveal)
+                    : null,
+              )
+            : TextSpan(
+                text: '🔒 ${message.cipherHex}',
+                style: const TextStyle(
+                  color: VaultXColors.phosphorDim,
+                  fontStyle: FontStyle.italic,
+                ),
+                recognizer: TapGestureRecognizer()..onTap = onToggleReveal,
+              );
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
@@ -1280,7 +1594,9 @@ class _MessageLine extends StatelessWidget {
         text: TextSpan(
           style: const TextStyle(fontFamily: VaultXFonts.mono, fontSize: 13),
           children: [
-            TextSpan(text: '[$time] ', style: const TextStyle(color: VaultXColors.phosphorDim)),
+            TextSpan(
+                text: '[$time] ',
+                style: const TextStyle(color: VaultXColors.phosphorDim)),
             TextSpan(
               text: '<$prefix>: ',
               style: TextStyle(color: color, fontWeight: FontWeight.bold),
