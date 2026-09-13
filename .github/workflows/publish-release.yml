@@ -44,7 +44,7 @@ jobs:
           assert build['path'] == '.github/workflows/release.yml'
           assert tag['object']['type'] == 'commit'
           assert build['head_sha'] == tag['object']['sha']
-          assert release['isDraft'], 'Release already public; do not modify it'
+          assert isinstance(release['isDraft'], bool)
           version = os.environ['RELEASE_TAG'][1:]
           expected = {f'VaultXSetup-{version}.exe', f'VaultXSetup-{version}.exe.sha256', 'VaultX-macOS.zip', 'VaultX-linux-x86_64.tar.gz'}
           assets = {a['name']: a for a in release['assets']}
@@ -58,7 +58,23 @@ jobs:
           unzip -tq VaultX-macOS.zip
           tar -tzf VaultX-linux-x86_64.tar.gz > /dev/null
           cd "$GITHUB_WORKSPACE"
-          git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          git show "$RELEASE_TAG:docs/CHAT-UPDATE-$version.md" > "$RUNNER_TEMP/notes.md"
-          gh release edit "$RELEASE_TAG" --draft=false --latest --notes-file "$RUNNER_TEMP/notes.md"
-          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx false
+          if python3 -c 'import json,os,pathlib,sys; sys.exit(0 if json.loads((pathlib.Path(os.environ["RUNNER_TEMP"])/"release.json").read_text())["isDraft"] else 1)'; then
+            git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            git show "$RELEASE_TAG:docs/CHAT-UPDATE-$version.md" > "$RUNNER_TEMP/notes.md"
+            # GitHub can apply a release update and then return HTTP 500.
+            # Do not repeat the mutation; verify the resulting public state.
+            if ! gh release edit "$RELEASE_TAG" --draft=false --latest --notes-file "$RUNNER_TEMP/notes.md"; then
+              echo 'Publication returned an error; checking whether it took effect.'
+            fi
+          else
+            echo 'Release already public; verified packages without modifying it.'
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq '.draft' | grep -qx false; then
+              echo 'Public release verified.'
+              exit 0
+            fi
+            sleep 3
+          done
+          echo 'Public release could not be verified.'
+          exit 1

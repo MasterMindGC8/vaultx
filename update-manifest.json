@@ -1,17 +1,17 @@
 {
   "windows": {
-    "version": "1.6.5",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.5/VaultXSetup-1.6.5.exe",
-    "notes": "Transfer progress with speed and approximate ETA, clearer delivery/failure states, streamed uploads and quieter idle graphics. 64 MiB per file; confirmed upload progress requires both people on 1.6.5. Relay improvements require a separate server update."
+    "version": "1.6.6",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.6/VaultXSetup-1.6.6.exe",
+    "notes": "Chat fixes, online status, sent/received confirmations, Retry, reconnect, local history toggle and relay latency. Both people should update to 1.6.6. Two ticks mean received by the app, not read by a person. Offline messages may need Retry after reopening."
   },
   "macos": {
-    "version": "1.6.5",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.5/VaultX-macOS.zip",
-    "notes": "Transfer progress with speed and approximate ETA, clearer delivery/failure states, streamed uploads and quieter idle graphics. 64 MiB per file; confirmed upload progress requires both people on 1.6.5. Relay improvements require a separate server update. Unsigned macOS build; right-click the app and choose Open on first launch."
+    "version": "1.6.6",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.6/VaultX-macOS.zip",
+    "notes": "Chat fixes, online status, sent/received confirmations, Retry, reconnect, local history toggle and relay latency. Both people should update to 1.6.6. Two ticks mean received by the app, not read by a person. Offline messages may need Retry after reopening. Unsigned macOS build; right-click the app and choose Open on first launch."
   },
   "linux": {
-    "version": "1.6.5",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.5/VaultX-linux-x86_64.tar.gz",
-    "notes": "Transfer progress with speed and approximate ETA, clearer delivery/failure states, streamed uploads and quieter idle graphics. 64 MiB per file; confirmed upload progress requires both people on 1.6.5. Relay improvements require a separate server update. Extract the archive and run client_app inside bundle/."
+    "version": "1.6.6",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.6/VaultX-linux-x86_64.tar.gz",
+    "notes": "Chat fixes, online status, sent/received confirmations, Retry, reconnect, local history toggle and relay latency. Both people should update to 1.6.6. Two ticks mean received by the app, not read by a person. Offline messages may need Retry after reopening. Extract the archive and run client_app inside bundle/."
   }
 }
