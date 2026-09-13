@@ -204,7 +204,7 @@ void main() {
       await pumpScreen(tester);
       await tester.enterText(find.byType(TextField), 'hello?');
       await tapAsciiButton(tester, 'Send');
-      expect(find.text('NO ACTIVE SESSION WITH THIS CONTACT'), findsOneWidget);
+      expect(find.text('MESSAGE NOT SENT — TAP X TO RETRY'), findsOneWidget);
     });
 
     testWidgets('remove contact: Cancel keeps it, Remove clears it', (tester) async {
@@ -233,5 +233,6 @@ void main() {
 /// depending on duress_vault_screen.dart's VaultPaths (which is about the
 /// app's *own* two fixed vault files, not a place to stash test fixtures).
 class VaultPathsForTest {
-  static String dir() => Platform.environment['VAULTX_DATA_DIR'] ?? '.';
+  static String dir() => Platform.environment['VAULTX_DATA_DIR'] ??
+      (throw StateError('Set VAULTX_DATA_DIR to an empty scratch directory for tests'));
 }

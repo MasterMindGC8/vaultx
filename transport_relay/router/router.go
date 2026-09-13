@@ -237,6 +237,12 @@ func (h *Hub) readPump(c *client) {
 				case <-c.done:
 					return
 				}
+			} else {
+				select {
+				case c.send <- envelope{Type: "accepted", PacketID: env.PacketID}:
+				case <-c.done:
+					return
+				}
 			}
 		case "ack":
 			if env.PacketID != "" {

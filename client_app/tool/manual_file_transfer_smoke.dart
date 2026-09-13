@@ -68,6 +68,8 @@ Future<void> main() async {
           if (!done.isCompleted) done.complete();
         }
       case TextEnvelope():
+      case TextReceiptEnvelope():
+      case PresenceEnvelope():
       case FileReceiptEnvelope():
       case WipeEnvelope():
         break;

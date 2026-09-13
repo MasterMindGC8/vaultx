@@ -12,6 +12,7 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:web_socket_channel/io.dart';
 
 /// Wire-format tag prefixing every payload sent through the relay (see
 /// [RelayStream.send]), so the receiving side knows whether an incoming
@@ -43,6 +44,11 @@ class RelayStream {
 
   WebSocketChannel? _channel;
   bool _ready = false;
+  bool _closed = false;
+  final _acceptedController = StreamController<String>.broadcast();
+  final _rejectedController = StreamController<String>.broadcast();
+  Stream<String> get acceptedPackets => _acceptedController.stream;
+  Stream<String> get rejectedPackets => _rejectedController.stream;
   Timer? _connectTimer;
   Completer<void>? _connectAbort;
   final _deliveriesController = StreamController<RelayDelivery>.broadcast();
@@ -62,8 +68,10 @@ class RelayStream {
   bool get isConnected => _channel != null && _ready;
 
   Future<void> connect() async {
+    if (_closed) throw StateError('Relay stream closed');
     final wsUrl = _toWebSocketUrl(baseUrl, '/v1/stream');
-    final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+    final channel = IOWebSocketChannel.connect(Uri.parse(wsUrl),
+        pingInterval: const Duration(seconds: 20));
     _channel = channel;
     _connectAbort = Completer<void>();
     _connectTimer = Timer(const Duration(seconds: 15), () {
@@ -82,14 +90,22 @@ class RelayStream {
       _connectTimer?.cancel();
       _connectAbort = null;
     }
+    if (_closed) {
+      await channel.sink.close();
+      throw StateError('Relay connection cancelled');
+    }
     channel.sink.add(jsonEncode({'type': 'hello', 'sender': deviceId}));
     _channel = channel;
     _ready = true;
     _connectionController.add(true);
     channel.stream.listen(
       _handleIncoming,
-      onDone: _disconnected,
-      onError: (_) => _disconnected(),
+      onDone: () {
+        if (_channel == channel) _disconnected();
+      },
+      onError: (_) {
+        if (_channel == channel) _disconnected();
+      },
       cancelOnError: false,
     );
   }
@@ -102,7 +118,15 @@ class RelayStream {
     } catch (_) {
       return;
     }
+    if (_closed) return;
+    if (envelope['type'] == 'accepted') {
+      final id = envelope['packet_id'];
+      if (id is String) _acceptedController.add(id);
+      return;
+    }
     if (envelope['type'] == 'error') {
+      final id = envelope['packet_id'];
+      if (id is String) _rejectedController.add(id);
       // A relay rejection must not leave the UI believing the connection is
       // healthy. Receipt-based uploads fail visibly instead of queuing more.
       final channel = _channel;
@@ -144,6 +168,8 @@ class RelayStream {
   }
 
   Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
     _connectTimer?.cancel();
     if (_connectAbort?.isCompleted == false) {
       _connectAbort!.completeError(StateError('Connection cancelled'));
@@ -154,6 +180,8 @@ class RelayStream {
     await channel?.sink.close();
     await _deliveriesController.close();
     await _connectionController.close();
+    await _acceptedController.close();
+    await _rejectedController.close();
   }
 
   static String _toWebSocketUrl(String httpBaseUrl, String path) {
@@ -169,6 +197,18 @@ class RelayHttp {
   RelayHttp({required this.baseUrl});
 
   final String baseUrl;
+
+  /// HTTP application round-trip time, not ICMP ping or peer latency.
+  Future<Duration> measureLatency() async {
+    final clock = Stopwatch()..start();
+    final response = await http
+        .get(Uri.parse('$baseUrl/healthz'))
+        .timeout(const Duration(seconds: 5));
+    if (response.statusCode != 200) {
+      throw StateError('Relay health check failed');
+    }
+    return clock.elapsed;
+  }
 
   /// Publish this device's PQXDH prekey bundle so others can start a
   /// handshake with it asynchronously.

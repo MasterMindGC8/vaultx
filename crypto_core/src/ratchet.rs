@@ -87,6 +87,7 @@ impl RatchetMessage {
 /// key material zeroizes on drop; `Drop` on the struct additionally clears
 /// the skipped-key cache explicitly since `HashMap`'s own drop glue does not
 /// zeroize its entries.
+#[derive(Clone)]
 pub struct DoubleRatchet {
     root_key: [u8; 32],
     dh_self: StaticSecret,
@@ -197,6 +198,16 @@ impl DoubleRatchet {
     /// first if the sender's ratchet key has changed since the last message
     /// we received from them.
     pub fn decrypt(&mut self, message: &RatchetMessage, aad: &[u8]) -> Result<Vec<u8>> {
+        // Authenticate before committing any key/counter changes. A rejected
+        // packet must not poison the next valid message or consume a skipped
+        // message key. Both discarded and replaced states zeroize on drop.
+        let mut candidate = self.clone();
+        let plaintext = candidate.decrypt_inner(message, aad)?;
+        *self = candidate;
+        Ok(plaintext)
+    }
+
+    fn decrypt_inner(&mut self, message: &RatchetMessage, aad: &[u8]) -> Result<Vec<u8>> {
         let remote_key_bytes = message.sender_ratchet_key.to_bytes();
 
         if let Some(key) = self
@@ -442,5 +453,37 @@ mod tests {
         msg.ciphertext[last] ^= 0x01;
 
         assert!(bob.decrypt(&msg, b"aad").is_err());
+    }
+
+    #[test]
+    fn rejected_packet_does_not_break_later_valid_messages() {
+        let secret = StaticSecret::random();
+        let public = PublicKey::from(&secret);
+        let mut alice = DoubleRatchet::init_alice(RootKey([7; 32]), public);
+        let mut bob = DoubleRatchet::init_bob(RootKey([7; 32]), secret);
+        // A simultaneous, losing handshake produces a valid packet under
+        // unrelated keys. Reject it without changing the winning session.
+        let mut other = DoubleRatchet::init_alice(RootKey([9; 32]), public);
+        let unrelated = other.encrypt(b"synthetic probe", b"").unwrap();
+        assert!(bob.decrypt(&unrelated, b"").is_err());
+        let valid = alice.encrypt(b"synthetic message", b"").unwrap();
+        assert_eq!(bob.decrypt(&valid, b"").unwrap(), b"synthetic message");
+        let reply = bob.encrypt(b"synthetic reply", b"").unwrap();
+        assert_eq!(alice.decrypt(&reply, b"").unwrap(), b"synthetic reply");
+    }
+
+    #[test]
+    fn rejected_skipped_packet_does_not_consume_valid_key() {
+        let secret = StaticSecret::random();
+        let public = PublicKey::from(&secret);
+        let mut alice = DoubleRatchet::init_alice(RootKey([7; 32]), public);
+        let mut bob = DoubleRatchet::init_bob(RootKey([7; 32]), secret);
+        let first = alice.encrypt(b"first", b"").unwrap();
+        let second = alice.encrypt(b"second", b"").unwrap();
+        assert!(bob.decrypt(&second, b"").is_ok());
+        let mut corrupt = RatchetMessage::from_wire_bytes(&first.to_wire_bytes()).unwrap();
+        corrupt.ciphertext[0] ^= 1;
+        assert!(bob.decrypt(&corrupt, b"").is_err());
+        assert_eq!(bob.decrypt(&first, b"").unwrap(), b"first");
     }
 }

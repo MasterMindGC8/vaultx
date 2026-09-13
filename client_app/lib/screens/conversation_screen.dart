@@ -65,6 +65,7 @@ class ChatMessage {
     this.fileName,
     this.fileSize,
     this.filePath,
+    this.delivery = 'unconfirmed',
   });
 
   final String id;
@@ -80,6 +81,7 @@ class ChatMessage {
   final String? fileName;
   final int? fileSize;
   final String? filePath;
+  final String delivery;
 
   bool get isFile => fileName != null;
 
@@ -92,6 +94,7 @@ class ChatMessage {
         if (fileName != null) 'fileName': fileName,
         if (fileSize != null) 'fileSize': fileSize,
         if (filePath != null) 'filePath': filePath,
+        'delivery': delivery,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -103,6 +106,7 @@ class ChatMessage {
         fileName: json['fileName'] as String?,
         fileSize: json['fileSize'] as int?,
         filePath: json['filePath'] as String?,
+        delivery: json['delivery'] as String? ?? 'unconfirmed',
       );
 }
 
@@ -135,6 +139,18 @@ class _ConversationScreenState extends State<ConversationScreen> {
   late String _relayUrl;
   late RelayHttp _relayHttp;
   RelayStream? _relayStream;
+  Timer? _reconnectTimer;
+  Timer? _healthTimer;
+  bool _connecting = false;
+  bool _measuring = false;
+  int _retryCount = 0;
+  int? _relayLatencyMs;
+  bool _keepHistory = false;
+  bool _sendingText = false;
+  final Map<String, DateTime> _peerSeen = {};
+  final Set<String> _presenceCapable = {};
+  final Map<String, Contact> _pendingTexts = {};
+  final Map<String, String> _packetMessageIds = {};
 
   List<Contact> _contacts = [];
   Contact? _selectedContact;
@@ -156,6 +172,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
   final Map<String, TransferProgress> _transferProgress = {};
   final Map<String, Timer> _transferExpiry = {};
   final Set<String> _processedPackets = {};
+  final Set<String> _seenHandshakes = {};
   Future<void> _deliveryChain = Future<void>.value();
   String _transferKey(Contact contact, String id) => '${contact.deviceId}:$id';
 
@@ -164,8 +181,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
       if (!mounted || _isDisposing || _exitWipeDone) return;
       try {
         await _handleDelivery(delivery);
-      } catch (_) {
-        unawaited(AppLogger.warn('Incoming packet could not be processed'));
+      } catch (error) {
+        unawaited(AppLogger.warn(
+            'Incoming packet could not be processed (${error.runtimeType})'));
         if (mounted && !_isDisposing) {
           setState(() =>
               _connectionStatus = 'INCOMING DATA REJECTED — RETRY TRANSFER');
@@ -221,6 +239,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
     _relayHttp = RelayHttp(baseUrl: _relayUrl);
     _updateManifestUrl = _loadUpdateManifestUrl();
     _contacts = _loadContacts();
+    final seen = widget.vault.get(utf8.encode('seen_handshakes_v1'));
+    if (seen != null) {
+      try {
+        _seenHandshakes
+            .addAll((jsonDecode(utf8.decode(seen)) as List).cast<String>());
+      } catch (_) {
+        /* A missing cache cannot prevent opening a vault. */
+      } finally {
+        seen.fillRange(0, seen.length, 0);
+      }
+    }
+    _keepHistory =
+        widget.vault.get(utf8.encode('keep_history_v1'))?.firstOrNull == 1;
     for (final contact in _contacts) {
       _messagesByContact[contact.deviceId] = _loadHistory(contact);
     }
@@ -229,15 +260,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
     _lifecycleListener = AppLifecycleListener(onExitRequested: _wipeAllOnExit);
   }
 
-  /// Burns local chat history with every contact we still hold a session
-  /// with, and tells each peer (over that same encrypted session) to burn
-  /// theirs too — then holds real app exit open just long enough for
-  /// those sends to actually leave the socket before the window and
-  /// engine are destroyed. Idempotent: only runs once per screen
-  /// instance, since dispose() calls this too as a fallback for exit
-  /// paths that don't go through the lifecycle listener.
+  /// History OFF clears this device's chat on exit. Each person controls
+  /// their own history setting; closing this window does not erase theirs.
+  /// dispose() also calls this for exits without a lifecycle notification.
   Future<AppExitResponse> _wipeAllOnExit() async {
-    if (_exitWipeDone) return AppExitResponse.exit;
+    if (_exitWipeDone || _keepHistory) return AppExitResponse.exit;
     _exitWipeDone = true;
     // Logged but never awaited here: an `await` before the wipe loop below
     // would yield control back to the event loop, letting dispose()'s
@@ -247,13 +274,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
     // function's synchronous prefix, not after any await.
     unawaited(
         AppLogger.info('exit-wipe triggered (${_contacts.length} contact(s))'));
-    final hadAnySession =
-        _contacts.any((c) => _sessions.containsKey(c.deviceId));
     for (final contact in _contacts) {
-      _wipeContactHistory(contact, notifyPeer: true);
-    }
-    if (hadAnySession) {
-      await Future.delayed(const Duration(milliseconds: 400));
+      _wipeContactHistory(contact, notifyPeer: false);
     }
     return AppExitResponse.exit;
   }
@@ -301,11 +323,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
           .toList();
     } catch (_) {
       return [];
+    } finally {
+      stored.fillRange(0, stored.length, 0);
     }
   }
 
   void _persistHistory(Contact contact) {
-    final messages = _messagesByContact[contact.deviceId] ?? [];
+    final messages = _keepHistory
+        ? (_messagesByContact[contact.deviceId] ?? [])
+        : <ChatMessage>[];
     final encoded = jsonEncode(messages.map((m) => m.toJson()).toList());
     final bytes = utf8.encode(encoded);
     try {
@@ -319,6 +345,17 @@ class _ConversationScreenState extends State<ConversationScreen> {
   }
 
   Future<void> _connectToRelay() async {
+    if (_connecting || _isDisposing || !mounted) return;
+    _connecting = true;
+    _reconnectTimer?.cancel();
+    _healthTimer?.cancel();
+    final old = _relayStream;
+    _relayStream = null;
+    await old?.close();
+    if (!mounted || _isDisposing) {
+      _connecting = false;
+      return;
+    }
     setState(() => _connectionStatus = 'CONNECTING...');
     try {
       final bundle = widget.identity.publicBundleBytes();
@@ -328,9 +365,14 @@ class _ConversationScreenState extends State<ConversationScreen> {
       if (!published) throw StateError('Relay rejected the public key bundle');
       final stream = RelayStream(baseUrl: _relayUrl, deviceId: _myDeviceId);
       stream.deliveries.listen(_queueDelivery);
+      stream.acceptedPackets
+          .listen((id) => _updateDelivery(_packetMessageIds[id] ?? id, 'sent'));
+      stream.rejectedPackets.listen(
+          (id) => _updateDelivery(_packetMessageIds[id] ?? id, 'failed'));
       stream.connectionChanges.listen((connected) {
         if (mounted && !_isDisposing && _relayStream == stream && !connected) {
           setState(() => _connectionStatus = 'OFFLINE — CONNECTION LOST');
+          _scheduleReconnect();
         }
       });
       _relayStream = stream;
@@ -342,10 +384,135 @@ class _ConversationScreenState extends State<ConversationScreen> {
       _relayStream = stream;
       if (!mounted) return;
       setState(() => _connectionStatus = 'ONLINE');
+      _retryCount = 0;
+      unawaited(_restoreChatSessions());
+      unawaited(_checkRelayHealth());
+      _healthTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+        unawaited(_checkRelayHealth());
+        _checkPresence();
+      });
     } catch (e) {
       await AppLogger.error('relay connection failed ($_relayUrl)', e);
       if (!mounted) return;
       setState(() => _connectionStatus = 'OFFLINE — RELAY UNREACHABLE');
+      _scheduleReconnect();
+    } finally {
+      _connecting = false;
+    }
+  }
+
+  void _scheduleReconnect() {
+    if (_isDisposing || !mounted || _reconnectTimer?.isActive == true) return;
+    final seconds = [2, 5, 10, 30][_retryCount.clamp(0, 3)];
+    _retryCount++;
+    _reconnectTimer = Timer(Duration(seconds: seconds), _connectToRelay);
+  }
+
+  Future<void> _restoreChatSessions() async {
+    // Ratchet keys live in memory. Announce fresh sessions after this app
+    // reopens, even when the other person has kept their window open.
+    for (final contact in List<Contact>.of(_contacts)) {
+      if (!mounted || _isDisposing || !_isRelayConnected) return;
+      try {
+        await _ensureSession(contact);
+      } catch (_) {
+        // Sending can retry the lookup; a missing peer must not stop others.
+        unawaited(AppLogger.warn('A saved chat could not reconnect yet'));
+      }
+    }
+  }
+
+  Future<void> _checkRelayHealth() async {
+    if (_measuring || _isDisposing) return;
+    _measuring = true;
+    final http = _relayHttp;
+    try {
+      final elapsed = await http.measureLatency();
+      if (mounted && !_isDisposing && http == _relayHttp) {
+        setState(() => _relayLatencyMs = elapsed.inMilliseconds);
+      }
+    } catch (_) {
+      if (mounted && !_isDisposing) setState(() => _relayLatencyMs = null);
+    } finally {
+      _measuring = false;
+    }
+  }
+
+  void _checkPresence() {
+    if (!_isRelayConnected || _isDisposing) return;
+    for (final contact in _contacts) {
+      final session = _sessions[contact.deviceId];
+      if (session != null && _presenceCapable.contains(contact.deviceId)) {
+        try {
+          _sendEnvelope(contact, session, PresenceEnvelope(reply: false),
+              messageId: 'vx2-presence-${_newMessageId()}');
+        } catch (_) {/* next heartbeat retries */}
+      }
+    }
+    if (mounted) setState(() {});
+  }
+
+  bool? _peerOnline(String id) {
+    if (!_isRelayConnected) return false;
+    final seen = _peerSeen[id];
+    if (seen == null) return null;
+    if (DateTime.now().difference(seen) < const Duration(seconds: 45)) {
+      return true;
+    }
+    return _presenceCapable.contains(id) ? false : null;
+  }
+
+  void _rememberHandshake(String packetKey) {
+    _seenHandshakes.add(packetKey);
+    if (_seenHandshakes.length > 512) {
+      _seenHandshakes.remove(_seenHandshakes.first);
+    }
+    final bytes = utf8.encode(jsonEncode(_seenHandshakes.toList()));
+    try {
+      if (!widget.vault.put(utf8.encode('seen_handshakes_v1'), bytes)) {
+        _seenHandshakes.remove(packetKey);
+        throw StateError('Could not save handshake replay protection');
+      }
+    } finally {
+      bytes.fillRange(0, bytes.length, 0);
+    }
+  }
+
+  void _updateDelivery(String id, String status, {Contact? from}) {
+    if (!mounted || _isDisposing) return;
+    final contact = _pendingTexts[id];
+    if (contact == null ||
+        (from != null && from.deviceId != contact.deviceId)) {
+      return;
+    }
+    final messages = _messagesByContact[contact.deviceId];
+    final i = messages?.indexWhere((m) => m.id == id && m.fromSelf) ?? -1;
+    if (i < 0) return;
+    if (messages![i].delivery == 'received') return;
+    setState(() => messages[i] =
+        ChatMessage.fromJson({...messages[i].toJson(), 'delivery': status}));
+    if (status == 'received' || status == 'failed') _pendingTexts.remove(id);
+    try {
+      _persistHistory(contact);
+    } catch (_) {
+      setState(() => _connectionStatus = 'HISTORY COULD NOT BE SAVED');
+    }
+  }
+
+  void _toggleHistory() {
+    final next = !_keepHistory;
+    if (!widget.vault.put(
+        utf8.encode('keep_history_v1'), Uint8List.fromList([next ? 1 : 0]))) {
+      setState(() => _connectionStatus = 'HISTORY SETTING COULD NOT BE SAVED');
+      return;
+    }
+    setState(() => _keepHistory = next);
+    try {
+      for (final contact in _contacts) {
+        _persistHistory(contact);
+      }
+    } catch (_) {
+      setState(() => _connectionStatus = 'HISTORY UPDATE FAILED');
     }
   }
 
@@ -358,6 +525,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
     }
     final tag = delivery.payload[0];
     final body = delivery.payload.sublist(1);
+    if (tag == relayTagHandshake && _seenHandshakes.contains(packetKey)) {
+      _relayStream?.ack(delivery.packetId);
+      return;
+    }
 
     if (tag == relayTagHandshake) {
       final peer = delivery.sender;
@@ -371,6 +542,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       final weSelfInitiated = _selfInitiated.contains(peer);
       final weAreCanonicalInitiator = _myDeviceId.compareTo(peer) < 0;
       if (weSelfInitiated && weAreCanonicalInitiator) {
+        _rememberHandshake(packetKey);
         _relayStream?.ack(delivery.packetId);
         return;
       }
@@ -393,6 +565,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
         });
         _saveContacts();
       }
+      if (delivery.packetId.startsWith('vx2-')) {
+        _presenceCapable.add(peer);
+      }
+      if (mounted) setState(() {});
     } else if (tag == relayTagMessage) {
       final session = _sessions[delivery.sender];
       if (session == null) {
@@ -402,9 +578,25 @@ class _ConversationScreenState extends State<ConversationScreen> {
       }
       final plaintext = session.decrypt(Uint8List.fromList(body));
       if (plaintext == null) {
+        if (delivery.packetId.startsWith('vx2-presence-')) {
+          _relayStream?.ack(delivery.packetId);
+          return;
+        }
         AppLogger.warn('failed to decrypt message from ${delivery.sender}');
+        // Replaying this rejected ciphertext cannot restore lost session
+        // keys. Drop the transport copy; only an encrypted text receipt
+        // counts as received, and the sender can retry with fresh keys.
+        _relayStream?.ack(delivery.packetId);
+        setState(() => _connectionStatus =
+            'MESSAGE COULD NOT BE OPENED — ASK SENDER TO RETRY');
         return;
       }
+      if (_connectionStatus ==
+          'MESSAGE COULD NOT BE OPENED — ASK SENDER TO RETRY') {
+        setState(() => _connectionStatus = 'ONLINE');
+      }
+      _selfInitiated.remove(delivery.sender);
+      _peerSeen[delivery.sender] = DateTime.now();
       final contact = _contacts.firstWhere(
         (c) => c.deviceId == delivery.sender,
         orElse: () =>
@@ -421,6 +613,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
         }
       }
     }
+    if (tag == relayTagHandshake) _rememberHandshake(packetKey);
     _processedPackets.add(packetKey);
     if (_processedPackets.length > 2048) {
       _processedPackets.remove(_processedPackets.first);
@@ -431,19 +624,44 @@ class _ConversationScreenState extends State<ConversationScreen> {
   Future<void> _handleEnvelope(
       Contact contact, MessageEnvelope envelope, Uint8List ciphertext) async {
     switch (envelope) {
-      case TextEnvelope(:final body):
-        setState(() {
-          _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
-                ChatMessage(
-                  id: _newMessageId(),
-                  fromSelf: false,
-                  text: body,
-                  cipherHex: _bytesToHex(ciphertext),
-                  sentAt: DateTime.now(),
-                ),
-              );
-        });
-        _persistHistory(contact);
+      case TextEnvelope(:final body, :final id):
+        if (id != null && (id.isEmpty || id.length > 128)) {
+          throw const FormatException('Invalid text ID');
+        }
+        final duplicate = id != null &&
+            (_messagesByContact[contact.deviceId] ?? [])
+                .any((m) => !m.fromSelf && m.id == id);
+        if (!duplicate) {
+          setState(() {
+            _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
+                  ChatMessage(
+                    id: id ?? _newMessageId(),
+                    fromSelf: false,
+                    text: body,
+                    cipherHex: _bytesToHex(ciphertext),
+                    sentAt: DateTime.now(),
+                  ),
+                );
+          });
+          _persistHistory(contact);
+        }
+        if (id != null) {
+          _presenceCapable.add(contact.deviceId);
+          _sendEnvelope(
+              contact, _sessions[contact.deviceId]!, TextReceiptEnvelope(id));
+        }
+
+      case TextReceiptEnvelope(:final id):
+        _presenceCapable.add(contact.deviceId);
+        _updateDelivery(id, 'received', from: contact);
+
+      case PresenceEnvelope(:final reply):
+        _presenceCapable.add(contact.deviceId);
+        if (!reply) {
+          _sendEnvelope(contact, _sessions[contact.deviceId]!,
+              PresenceEnvelope(reply: true));
+        }
+        setState(() {});
 
       case FileOfferEnvelope(
           :final id,
@@ -690,19 +908,45 @@ class _ConversationScreenState extends State<ConversationScreen> {
       ),
     );
     if (result == null) return;
-    _sessions[result.contact.deviceId] = result.session;
-    _selfInitiated.add(result.contact.deviceId);
+    if (!mounted || _isDisposing) {
+      result.session.dispose();
+      return;
+    }
+    final peer = result.contact.deviceId;
+    // A handshake may already have arrived while Add Contact was open.
+    // Keep that shared session instead of replacing it with unrelated keys.
+    final alreadyConnected = _sessions.containsKey(peer);
+    if (alreadyConnected) {
+      result.session.dispose();
+    } else {
+      try {
+        if (!_isRelayConnected) throw StateError('Relay disconnected');
+        _relayStream!.send(
+            peer,
+            'vx2-${result.handshakePacketId}',
+            Uint8List.fromList(
+                [relayTagHandshake, ...result.handshakePayload]));
+      } catch (_) {
+        result.session.dispose();
+        setState(() =>
+            _connectionStatus = 'CONTACT NOT ADDED — RELAY OFFLINE; RETRY');
+        return;
+      }
+      _sessions[peer] = result.session;
+      _selfInitiated.add(peer);
+      _sendEnvelope(
+          result.contact, result.session, PresenceEnvelope(reply: false),
+          messageId: 'vx2-presence-${_newMessageId()}');
+    }
     setState(() {
-      _contacts = [..._contacts, result.contact];
-      _messagesByContact[result.contact.deviceId] = [];
+      _contacts = [
+        ..._contacts.where((c) => c.deviceId != peer),
+        result.contact
+      ];
+      _messagesByContact.putIfAbsent(peer, () => []);
       _selectedContact = result.contact;
     });
     _saveContacts();
-    _relayStream?.send(
-      result.contact.deviceId,
-      result.handshakePacketId,
-      Uint8List.fromList([relayTagHandshake, ...result.handshakePayload]),
-    );
   }
 
   /// Wipes a contact's session, history, and glare-tracking state and
@@ -757,7 +1001,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
   bool get _isRelayConnected => _relayStream?.isConnected ?? false;
 
   Uint8List _sendEnvelope(
-      Contact contact, NativeSession session, MessageEnvelope envelope) {
+      Contact contact, NativeSession session, MessageEnvelope envelope,
+      {String? messageId}) {
     if (!_isRelayConnected) throw StateError('Relay disconnected');
     final plaintext = envelope.encode();
     late Uint8List ciphertext;
@@ -767,7 +1012,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       plaintext.fillRange(0, plaintext.length, 0);
     }
     if (ciphertext.isEmpty) throw StateError('Encryption failed');
-    final packetId = _newMessageId();
+    final packetId = messageId ?? _newMessageId();
     _relayStream?.send(
       contact.deviceId,
       packetId,
@@ -776,39 +1021,96 @@ class _ConversationScreenState extends State<ConversationScreen> {
     return ciphertext;
   }
 
-  void _sendMessage() {
-    final text = _composerController.text.trim();
-    final contact = _selectedContact;
-    if (text.isEmpty || contact == null) return;
-    final session = _sessions[contact.deviceId];
-    if (session == null) {
-      setState(() => _connectionStatus = 'NO ACTIVE SESSION WITH THIS CONTACT');
-      return;
+  Future<NativeSession> _ensureSession(Contact contact) async {
+    final existing = _sessions[contact.deviceId];
+    if (existing != null) return existing;
+    final bundle = await _relayHttp.fetchPreKeyBundle(contact.deviceId);
+    if (!mounted || _isDisposing || !_isRelayConnected || bundle == null) {
+      throw StateError('Peer is not available');
     }
-    if (!_isRelayConnected) {
-      setState(() => _connectionStatus = 'OFFLINE — MESSAGE NOT SENT');
-      AppLogger.warn('dropped outgoing text: relay not connected');
-      return;
-    }
-    late Uint8List ciphertext;
+    // The peer may have initiated while the HTTP lookup was in flight.
+    final incoming = _sessions[contact.deviceId];
+    if (incoming != null) return incoming;
+    final outcome =
+        NativeCrypto.instance.initiateSession(widget.identity, bundle);
+    if (outcome == null) throw StateError('Handshake failed');
     try {
-      ciphertext = _sendEnvelope(contact, session, TextEnvelope(text));
+      _relayStream!.send(
+          contact.deviceId,
+          'vx2-${_newMessageId()}',
+          Uint8List.fromList(
+              [relayTagHandshake, ...outcome.initialMessageBytes]));
     } catch (_) {
-      setState(() => _connectionStatus = 'MESSAGE NOT SENT — CHECK CONNECTION');
+      outcome.session.dispose();
+      rethrow;
+    }
+    _sessions[contact.deviceId] = outcome.session;
+    _selfInitiated.add(contact.deviceId);
+    _sendEnvelope(contact, outcome.session, PresenceEnvelope(reply: false),
+        messageId: 'vx2-presence-${_newMessageId()}');
+    return outcome.session;
+  }
+
+  Future<void> _sendMessage({ChatMessage? retry, Contact? retryContact}) async {
+    final text = retry?.text ?? _composerController.text.trim();
+    final contact = retryContact ?? _selectedContact;
+    if (text.isEmpty || contact == null || _sendingText) return;
+    if (retry != null &&
+        (_messagesByContact[contact.deviceId] ?? [])
+            .any((m) => m.id == retry.id && m.delivery == 'received')) {
       return;
     }
+    _sendingText = true;
+    final id = retry?.id ?? _newMessageId();
     setState(() {
-      _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
+      if (retry == null) {
+        _messagesByContact.putIfAbsent(contact.deviceId, () => []).add(
             ChatMessage(
-              id: _newMessageId(),
-              fromSelf: true,
-              text: text,
-              cipherHex: _bytesToHex(ciphertext),
-              sentAt: DateTime.now(),
-            ),
-          );
-      _composerController.clear();
+                id: id,
+                fromSelf: true,
+                text: text,
+                sentAt: DateTime.now(),
+                delivery: 'pending'));
+        _composerController.clear();
+      }
     });
+    _pendingTexts[id] = contact;
+    // Older clients never send receipts. Bound bookkeeping while leaving
+    // their message status honestly unconfirmed in the conversation.
+    if (_pendingTexts.length > 2048) {
+      _pendingTexts.remove(_pendingTexts.keys.first);
+    }
+    try {
+      if (!_isRelayConnected) await _connectToRelay();
+      if (!_isRelayConnected) throw StateError('Relay offline');
+      final session = await _ensureSession(contact);
+      if (!mounted || _isDisposing) return;
+      // A new transport packet can be decrypted after a peer restarts. Keep
+      // the logical message ID unchanged so the receiver can deduplicate it.
+      final packetId = retry == null ? id : '$id-retry-${_newMessageId()}';
+      _packetMessageIds[packetId] = id;
+      if (_packetMessageIds.length > 2048) {
+        _packetMessageIds.remove(_packetMessageIds.keys.first);
+      }
+      final ciphertext = _sendEnvelope(
+          contact, session, TextEnvelope(text, id: id),
+          messageId: packetId);
+      final messages = _messagesByContact[contact.deviceId]!;
+      final index = messages.indexWhere((m) => m.id == id);
+      setState(() => messages[index] = ChatMessage.fromJson({
+            ...messages[index].toJson(),
+            'cipherHex': _bytesToHex(ciphertext),
+            'delivery': 'pending'
+          }));
+    } catch (_) {
+      if (mounted && !_isDisposing) {
+        _updateDelivery(id, 'failed');
+        setState(() => _connectionStatus = 'MESSAGE NOT SENT — TAP X TO RETRY');
+      }
+    } finally {
+      _sendingText = false;
+    }
+    if (!mounted || _isDisposing) return;
     try {
       _persistHistory(contact);
     } catch (_) {
@@ -989,7 +1291,14 @@ class _ConversationScreenState extends State<ConversationScreen> {
     _relayHttp = RelayHttp(baseUrl: newUrl);
     await _relayStream?.close();
     _relayStream = null;
+    for (final session in _sessions.values) {
+      session.dispose();
+    }
     _sessions.clear();
+    _selfInitiated.clear();
+    _peerSeen.clear();
+    _presenceCapable.clear();
+    _relayLatencyMs = null;
     await _connectToRelay();
   }
 
@@ -1120,6 +1429,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   @override
   void dispose() {
+    _reconnectTimer?.cancel();
+    _healthTimer?.cancel();
     _isDisposing = true;
     // Fallback only — _wipeAllOnExit is guarded by _exitWipeDone, so this
     // is a no-op on the normal path (already ran, and got to actually
@@ -1181,9 +1492,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
                           ),
                           GestureDetector(
                             onTap: _editRelayUrl,
-                            child: const Text(
-                              '[relay]',
-                              style: TextStyle(
+                            child: Text(
+                              '[relay ${_relayLatencyMs == null ? '—' : '$_relayLatencyMs ms'}]',
+                              style: const TextStyle(
                                 color: VaultXColors.phosphorDim,
                                 fontFamily: VaultXFonts.mono,
                                 fontSize: 11,
@@ -1224,7 +1535,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
                                 contact: contact,
                                 selected: contact.deviceId ==
                                     _selectedContact?.deviceId,
-                                online: _sessions.containsKey(contact.deviceId),
+                                online: _peerOnline(contact.deviceId),
                                 onTap: () =>
                                     setState(() => _selectedContact = contact),
                                 onRemove: () => _removeContact(contact),
@@ -1287,6 +1598,16 @@ class _ConversationScreenState extends State<ConversationScreen> {
                                     onPressed: _checkForUpdates),
                                 AsciiButton(
                                     label: 'View Log', onPressed: _openLog),
+                                Tooltip(
+                                    message:
+                                        'On saves encrypted chat history. Off clears saved text history and keeps this conversation only until you close the app. Received files may still exist on disk.',
+                                    child: AsciiButton(
+                                        label:
+                                            'History: ${_keepHistory ? 'ON' : 'OFF'}',
+                                        onPressed: _toggleHistory)),
+                                AsciiButton(
+                                    label: 'Retry connection',
+                                    onPressed: _connectToRelay),
                               ],
                             ),
                           ),
@@ -1340,6 +1661,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
                                             .contains(message.id),
                                         onToggleReveal: () =>
                                             _toggleReveal(message.id),
+                                        onRetry: () => _sendMessage(
+                                            retry: message,
+                                            retryContact: _selectedContact),
                                       );
                                     },
                                   ),
@@ -1473,7 +1797,7 @@ class _ContactListTile extends StatelessWidget {
 
   final Contact contact;
   final bool selected;
-  final bool online;
+  final bool? online;
   final VoidCallback onTap;
   final VoidCallback onRemove;
 
@@ -1499,7 +1823,24 @@ class _ContactListTile extends StatelessWidget {
                 ),
               ),
             ),
-            if (online) const StatusDot(),
+            Tooltip(
+                message: online == null
+                    ? 'Presence unknown — peer has not confirmed'
+                    : online!
+                        ? 'Online — recent encrypted response'
+                        : 'Offline or unreachable',
+                child: Container(
+                  width: 9,
+                  height: 9,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: online == null
+                        ? Colors.grey
+                        : online!
+                            ? VaultXColors.phosphor
+                            : VaultXColors.alertRed,
+                  ),
+                )),
             const SizedBox(width: 8),
             GestureDetector(
               onTap: onRemove,
@@ -1524,11 +1865,13 @@ class _MessageLine extends StatelessWidget {
     required this.message,
     required this.revealed,
     required this.onToggleReveal,
+    this.onRetry,
   });
 
   final ChatMessage message;
   final bool revealed;
   final VoidCallback onToggleReveal;
+  final VoidCallback? onRetry;
 
   static String _formatSize(int bytes) {
     if (bytes < 1024) return '$bytes B';
@@ -1602,6 +1945,22 @@ class _MessageLine extends StatelessWidget {
               style: TextStyle(color: color, fontWeight: FontWeight.bold),
             ),
             bodySpan,
+            if (message.fromSelf && !message.isFile)
+              TextSpan(
+                text: switch (message.delivery) {
+                  'received' => '  ✓✓ Received',
+                  'sent' => '  ✓ Sent to relay — Retry',
+                  'failed' => '  X Not sent — Retry',
+                  _ => '  … Delivery unconfirmed — Retry',
+                },
+                style: TextStyle(
+                    color: message.delivery == 'failed'
+                        ? VaultXColors.alertRed
+                        : VaultXColors.phosphorDim),
+                recognizer: message.delivery != 'received'
+                    ? (TapGestureRecognizer()..onTap = onRetry)
+                    : null,
+              ),
           ],
         ),
       ),

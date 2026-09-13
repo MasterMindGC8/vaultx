@@ -96,7 +96,10 @@ class _AddContactScreenState extends State<AddContactScreen> {
         setState(() => _statusMessage = 'HANDSHAKE FAILED — MALFORMED BUNDLE');
         return;
       }
-      if (!mounted) return;
+      if (!mounted) {
+        outcome.session.dispose();
+        return;
+      }
       Navigator.of(context).pop(
         AddContactResult(
           contact: Contact(
@@ -110,6 +113,11 @@ class _AddContactScreenState extends State<AddContactScreen> {
           handshakePayload: outcome.initialMessageBytes,
         ),
       );
+    } catch (_) {
+      if (mounted) {
+        setState(() => _statusMessage =
+            'COULD NOT REACH RELAY — CHECK CONNECTION AND RETRY');
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }

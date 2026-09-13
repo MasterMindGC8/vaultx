@@ -18,6 +18,7 @@
 // and reopening the app rather than starting fresh every time.
 //
 // Run with: flutter test test/ux_auth_flow_test.dart
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -33,6 +34,9 @@ void main() {
   // (vault create/unlock, identity generation) would otherwise hit
   // NativeCrypto.instance before the native library is loaded.
   setUpAll(() async {
+    if (Platform.environment['VAULTX_DATA_DIR'] == null) {
+      throw StateError('Set VAULTX_DATA_DIR to an empty test directory before running UI tests');
+    }
     await NativeCrypto.ensureInitialized();
   });
 

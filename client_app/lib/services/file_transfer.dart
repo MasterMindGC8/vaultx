@@ -47,7 +47,9 @@ sealed class MessageEnvelope {
   static MessageEnvelope fromJson(Map<String, dynamic> json) {
     switch (json['t'] as String?) {
       case 'text':
-        return TextEnvelope(json['body'] as String);
+        return TextEnvelope(json['body'] as String, id: json['id'] as String?);
+      case 'text_receipt':
+        return TextReceiptEnvelope(json['id'] as String);
       case 'file_offer':
         return FileOfferEnvelope(
           id: json['id'] as String,
@@ -65,6 +67,14 @@ sealed class MessageEnvelope {
       case 'file_done':
         return FileDoneEnvelope(json['id'] as String);
       case 'file_receipt':
+        // Older clients already ignore receipts with no matching transfer.
+        // Negotiate presence without sending them an unknown message type.
+        if (json['id'] == '__vaultx_presence_v1__' &&
+            json['bytes'] == 0 &&
+            (json['stage'] == 'presence-request' ||
+                json['stage'] == 'presence-reply')) {
+          return PresenceEnvelope(reply: json['stage'] == 'presence-reply');
+        }
         return FileReceiptEnvelope(
             id: json['id'] as String,
             bytes: json['bytes'] as int,
@@ -83,11 +93,34 @@ sealed class MessageEnvelope {
 }
 
 class TextEnvelope extends MessageEnvelope {
-  TextEnvelope(this.body);
+  TextEnvelope(this.body, {this.id});
   final String body;
+  final String? id;
 
   @override
-  Map<String, dynamic> toJson() => {'t': 'text', 'body': body};
+  Map<String, dynamic> toJson() =>
+      {'t': 'text', 'body': body, if (id != null) 'id': id};
+}
+
+/// Sent only when a text includes an ID requesting confirmation. Older
+/// senders do not request receipts and never receive an unknown envelope.
+class TextReceiptEnvelope extends MessageEnvelope {
+  TextReceiptEnvelope(this.id);
+  final String id;
+  @override
+  Map<String, dynamic> toJson() => {'t': 'text_receipt', 'id': id};
+}
+
+class PresenceEnvelope extends MessageEnvelope {
+  PresenceEnvelope({required this.reply});
+  final bool reply;
+  @override
+  Map<String, dynamic> toJson() => {
+        't': 'file_receipt',
+        'id': '__vaultx_presence_v1__',
+        'bytes': 0,
+        'stage': reply ? 'presence-reply' : 'presence-request'
+      };
 }
 
 /// Sent once, before any chunks, so the receiver knows what's coming (name,
