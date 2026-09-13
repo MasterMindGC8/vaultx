@@ -1,0 +1,64 @@
+name: Publish verified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag
+        required: true
+      build_run:
+        description: Successful release.yml build run ID
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify build, packages and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          BUILD_RUN: ${{ inputs.build_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$BUILD_RUN" =~ ^[0-9]+$ ]]
+          version="${RELEASE_TAG#v}"
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN" > "$RUNNER_TEMP/build.json"
+          gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > "$RUNNER_TEMP/tag.json"
+          gh release view "$RELEASE_TAG" --json isDraft,assets > "$RUNNER_TEMP/release.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          build = json.loads((root/'build.json').read_text())
+          tag = json.loads((root/'tag.json').read_text())
+          release = json.loads((root/'release.json').read_text())
+          assert build['conclusion'] == 'success'
+          assert build['path'] == '.github/workflows/release.yml'
+          assert tag['object']['type'] == 'commit'
+          assert build['head_sha'] == tag['object']['sha']
+          assert release['isDraft'], 'Release already public; do not modify it'
+          version = os.environ['RELEASE_TAG'][1:]
+          expected = {f'VaultXSetup-{version}.exe', f'VaultXSetup-{version}.exe.sha256', 'VaultX-macOS.zip', 'VaultX-linux-x86_64.tar.gz'}
+          assets = {a['name']: a for a in release['assets']}
+          assert expected <= assets.keys()
+          assert all(assets[name]['size'] > 0 for name in expected)
+          PY
+          mkdir "$RUNNER_TEMP/packages"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/packages"
+          cd "$RUNNER_TEMP/packages"
+          sed '1s/^\xEF\xBB\xBF//' "VaultXSetup-$version.exe.sha256" | sha256sum --check
+          unzip -tq VaultX-macOS.zip
+          tar -tzf VaultX-linux-x86_64.tar.gz > /dev/null
+          cd "$GITHUB_WORKSPACE"
+          git fetch origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          git show "$RELEASE_TAG:docs/CHAT-UPDATE-$version.md" > "$RUNNER_TEMP/notes.md"
+          gh release edit "$RELEASE_TAG" --draft=false --latest --notes-file "$RUNNER_TEMP/notes.md"
+          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx false
