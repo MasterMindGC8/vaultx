@@ -1,17 +1,17 @@
 {
   "windows": {
-    "version": "1.6.4",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.4/VaultXSetup-1.6.4.exe",
-    "notes": "Added drag-and-drop file sending — drop any file onto the chat window to send it. Fixed an installer issue where a newly added plugin's file could be missing."
+    "version": "1.6.5",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.5/VaultXSetup-1.6.5.exe",
+    "notes": "Transfer progress with speed and approximate ETA, clearer delivery/failure states, streamed uploads and quieter idle graphics. 64 MiB per file; confirmed upload progress requires both people on 1.6.5. Relay improvements require a separate server update."
   },
   "macos": {
-    "version": "1.6.4",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.4/VaultX-macOS.zip",
-    "notes": "Added drag-and-drop file sending — drop any file onto the chat window to send it. Unsigned build — right-click the app and choose Open the first time to get past Gatekeeper."
+    "version": "1.6.5",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.5/VaultX-macOS.zip",
+    "notes": "Transfer progress with speed and approximate ETA, clearer delivery/failure states, streamed uploads and quieter idle graphics. 64 MiB per file; confirmed upload progress requires both people on 1.6.5. Relay improvements require a separate server update. Unsigned macOS build; right-click the app and choose Open on first launch."
   },
   "linux": {
-    "version": "1.6.4",
-    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.4/VaultX-linux-x86_64.tar.gz",
-    "notes": "Added drag-and-drop file sending — drop any file onto the chat window to send it. Extract the tarball and run the client_app executable inside bundle/."
+    "version": "1.6.5",
+    "installer_url": "https://github.com/MasterMindGC8/vaultx/releases/download/v1.6.5/VaultX-linux-x86_64.tar.gz",
+    "notes": "Transfer progress with speed and approximate ETA, clearer delivery/failure states, streamed uploads and quieter idle graphics. 64 MiB per file; confirmed upload progress requires both people on 1.6.5. Relay improvements require a separate server update. Extract the archive and run client_app inside bundle/."
   }
 }
